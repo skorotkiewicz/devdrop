@@ -31,6 +31,7 @@ fn run() -> Result<(), String> {
         Some("repo") => cmd_repo(&args[1..]),
         Some("remote") => cmd_remote(&args[1..]),
         Some("secret") => cmd_secret(&args[1..]),
+        Some("agent") => cmd_agent(&args[1..]),
         Some("run") => cmd_run(&args[1..]),
         Some("daemon") => cmd_daemon(&args[1..]),
         Some("sync") => cmd_sync(&args[1..]),
@@ -59,6 +60,11 @@ Usage:
   devdrop secret add <path> --scope <scope>
   devdrop secret unlock <path> [--scope <scope>]
   devdrop secret lock <path> [--scope <scope>]
+  devdrop agent create --repo <path> [--write-scope <scope>] [--secret-scope <scope>]
+  devdrop agent status
+  devdrop agent diff <agent-id>
+  devdrop agent accept <agent-id>
+  devdrop agent reject <agent-id>
   devdrop run --repo <path> --secret-scope <scope> -- <command>
   devdrop daemon [path] [--remote <path>] [--interval <seconds>] [--once]
   devdrop sync [path] [--remote <path>] [--pull]
@@ -135,6 +141,131 @@ fn cmd_secret(args: &[String]) -> Result<(), String> {
         }
         _ => Err("usage: devdrop secret add|unlock|lock <path> [--scope <scope>]".into()),
     }
+}
+
+fn cmd_agent(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("create") => {
+            let repo = flag_value(args, "--repo")
+                .map(PathBuf::from)
+                .ok_or_else(|| "usage: devdrop agent create --repo <path>".to_string())?;
+            let write_scope = flag_value(args, "--write-scope").unwrap_or("**");
+            let secret_scope = flag_value(args, "--secret-scope").unwrap_or("");
+            cmd_agent_create(&repo, write_scope, secret_scope)
+        }
+        Some("status") => cmd_agent_status(),
+        Some("diff") => cmd_agent_diff(required_arg(args.get(1), "agent diff")?),
+        Some("accept") => cmd_agent_finish(required_arg(args.get(1), "agent accept")?, true),
+        Some("reject") => cmd_agent_finish(required_arg(args.get(1), "agent reject")?, false),
+        _ => Err("usage: devdrop agent create|status|diff|accept|reject".into()),
+    }
+}
+
+fn cmd_agent_create(repo: &Path, write_scope: &str, secret_scope: &str) -> Result<(), String> {
+    require_dir(repo)?;
+    let root = find_workspace_root(repo).ok_or_else(|| {
+        "no .devdrop workspace found; run `devdrop workspace init <path>`".to_string()
+    })?;
+    init_db(&root)?;
+    let id = format!("agent_{}", now_nanos());
+    let overlay = agent_overlay_path(&root, &id);
+    copy_tree(repo, &overlay)?;
+    upsert_agent(
+        &root,
+        &id,
+        repo,
+        &overlay,
+        write_scope,
+        secret_scope,
+        "pending",
+    )?;
+    log_operation(
+        &root,
+        "agent_create",
+        &pin_path(&root, repo),
+        &format!("{{\"agent\":{}}}", json_string(&id)),
+        "done",
+    )?;
+    println!("agent created: {id}");
+    println!("overlay: {}", display_path(&overlay));
+    Ok(())
+}
+
+fn cmd_agent_status() -> Result<(), String> {
+    let root = env::current_dir()
+        .map_err(|err| format!("current dir: {err}"))
+        .ok()
+        .and_then(|dir| find_workspace_root(&dir))
+        .ok_or_else(|| "no .devdrop workspace found".to_string())?;
+    let agents = list_agents(&root)?;
+    if agents.is_empty() {
+        println!("no agent workspaces");
+        return Ok(());
+    }
+
+    for agent in agents {
+        println!(
+            "{} status={} repo={} overlay={} write_scope={} secret_scope={}",
+            agent.id,
+            agent.status,
+            agent.repo_path,
+            agent.overlay_path,
+            agent.write_scope,
+            if agent.secret_scope.is_empty() {
+                "none"
+            } else {
+                &agent.secret_scope
+            }
+        );
+    }
+    Ok(())
+}
+
+fn cmd_agent_diff(id: &str) -> Result<(), String> {
+    let (root, agent) = find_agent(id)?;
+    ensure_agent_pending(&agent)?;
+    let output = Command::new("diff")
+        .args(["-ruN"])
+        .arg(&agent.repo_path)
+        .arg(&agent.overlay_path)
+        .output()
+        .map_err(|err| format!("run diff: {err}"))?;
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    if output.status.code() == Some(2) {
+        return Err("diff failed".into());
+    }
+    log_operation(
+        &root,
+        "agent_diff",
+        &agent.repo_path,
+        &format!("{{\"agent\":{}}}", json_string(id)),
+        "done",
+    )?;
+    Ok(())
+}
+
+fn cmd_agent_finish(id: &str, accept: bool) -> Result<(), String> {
+    let (root, agent) = find_agent(id)?;
+    ensure_agent_pending(&agent)?;
+    if accept {
+        copy_tree(Path::new(&agent.overlay_path), Path::new(&agent.repo_path))?;
+    }
+    let status = if accept { "accepted" } else { "rejected" };
+    update_agent_status(&root, id, status)?;
+    log_operation(
+        &root,
+        if accept {
+            "agent_accept"
+        } else {
+            "agent_reject"
+        },
+        &agent.repo_path,
+        &format!("{{\"agent\":{}}}", json_string(id)),
+        "done",
+    )?;
+    println!("agent {status}: {id}");
+    Ok(())
 }
 
 fn cmd_run(args: &[String]) -> Result<(), String> {
@@ -695,6 +826,142 @@ fn read_remote_config(root: &Path) -> Result<Option<PathBuf>, String> {
     Ok((!text.is_empty()).then(|| PathBuf::from(text)))
 }
 
+struct AgentRow {
+    id: String,
+    repo_path: String,
+    overlay_path: String,
+    write_scope: String,
+    secret_scope: String,
+    status: String,
+}
+
+fn agent_overlay_path(root: &Path, id: &str) -> PathBuf {
+    root.join(".devdrop/agents").join(id).join("overlay")
+}
+
+fn upsert_agent(
+    root: &Path,
+    id: &str,
+    repo: &Path,
+    overlay: &Path,
+    write_scope: &str,
+    secret_scope: &str,
+    status: &str,
+) -> Result<(), String> {
+    let now = now_secs();
+    run_sql(
+        &db_path(root),
+        &format!(
+            "INSERT OR REPLACE INTO agents (id, workspace_id, repo_path, overlay_path, write_scope, secret_scope, status, created_at, updated_at) VALUES ({}, 'local', {}, {}, {}, {}, {}, {}, {});\n",
+            sql_string(id),
+            sql_string(&repo.to_string_lossy()),
+            sql_string(&overlay.to_string_lossy()),
+            sql_string(write_scope),
+            sql_string(secret_scope),
+            sql_string(status),
+            now,
+            now
+        ),
+    )
+}
+
+fn update_agent_status(root: &Path, id: &str, status: &str) -> Result<(), String> {
+    run_sql(
+        &db_path(root),
+        &format!(
+            "UPDATE agents SET status={}, updated_at={} WHERE id={};\n",
+            sql_string(status),
+            now_secs(),
+            sql_string(id)
+        ),
+    )
+}
+
+fn list_agents(root: &Path) -> Result<Vec<AgentRow>, String> {
+    init_db(root)?;
+    query_lines(
+        &db_path(root),
+        "SELECT hex(id)||char(9)||hex(repo_path)||char(9)||hex(overlay_path)||char(9)||hex(write_scope)||char(9)||hex(secret_scope)||char(9)||hex(status) FROM agents ORDER BY created_at, id;",
+    )?
+    .into_iter()
+    .map(|line| parse_agent_row(&line))
+    .collect()
+}
+
+fn parse_agent_row(line: &str) -> Result<AgentRow, String> {
+    let fields = line.split('\t').collect::<Vec<_>>();
+    if fields.len() != 6 {
+        return Err("bad agent row".into());
+    }
+    Ok(AgentRow {
+        id: hex_decode_string(fields[0])?,
+        repo_path: hex_decode_string(fields[1])?,
+        overlay_path: hex_decode_string(fields[2])?,
+        write_scope: hex_decode_string(fields[3])?,
+        secret_scope: hex_decode_string(fields[4])?,
+        status: hex_decode_string(fields[5])?,
+    })
+}
+
+fn find_agent(id: &str) -> Result<(PathBuf, AgentRow), String> {
+    let cwd = env::current_dir().map_err(|err| format!("current dir: {err}"))?;
+    let root =
+        find_workspace_root(&cwd).ok_or_else(|| "no .devdrop workspace found".to_string())?;
+    let agent = list_agents(&root)?
+        .into_iter()
+        .find(|agent| agent.id == id)
+        .ok_or_else(|| format!("agent not found: {id}"))?;
+    Ok((root, agent))
+}
+
+fn ensure_agent_pending(agent: &AgentRow) -> Result<(), String> {
+    if agent.status == "pending" {
+        Ok(())
+    } else {
+        Err(format!("agent {} is {}", agent.id, agent.status))
+    }
+}
+
+fn copy_tree(src: &Path, dest: &Path) -> Result<(), String> {
+    require_dir(src)?;
+    fs::create_dir_all(dest).map_err(|err| format!("create {}: {err}", display_path(dest)))?;
+    copy_tree_inner(src, dest, src)
+}
+
+fn copy_tree_inner(root: &Path, dest_root: &Path, current: &Path) -> Result<(), String> {
+    for entry in
+        fs::read_dir(current).map_err(|err| format!("read {}: {err}", display_path(current)))?
+    {
+        let entry = entry.map_err(|err| format!("read {}: {err}", display_path(current)))?;
+        let src = entry.path();
+        let rel = src
+            .strip_prefix(root)
+            .map_err(|err| format!("relative path: {err}"))?;
+        if rel.components().next().is_some_and(|part| {
+            let part = part.as_os_str();
+            part == ".git" || part == ".devdrop"
+        }) {
+            continue;
+        }
+        let dest = dest_root.join(rel);
+        let file_type = entry
+            .file_type()
+            .map_err(|err| format!("stat {}: {err}", display_path(&src)))?;
+        if file_type.is_dir() {
+            fs::create_dir_all(&dest)
+                .map_err(|err| format!("create {}: {err}", display_path(&dest)))?;
+            copy_tree_inner(root, dest_root, &src)?;
+        } else if file_type.is_file() {
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|err| format!("create {}: {err}", display_path(parent)))?;
+            }
+            fs::copy(&src, &dest).map_err(|err| format!("copy {}: {err}", display_path(&src)))?;
+        }
+    }
+    Ok(())
+}
+
 fn fetch_remote_object(root: &Path, hash: &str) -> Result<(), String> {
     let remote = read_remote_config(root)?
         .ok_or_else(|| format!("object {hash} is not local and no remote is configured"))?;
@@ -790,6 +1057,17 @@ CREATE TABLE IF NOT EXISTS secrets (
   updated_at INTEGER NOT NULL,
   UNIQUE(workspace_id, path, scope)
 );
+CREATE TABLE IF NOT EXISTS agents (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL,
+  repo_path TEXT NOT NULL,
+  overlay_path TEXT NOT NULL,
+  write_scope TEXT NOT NULL,
+  secret_scope TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
 ";
     run_sql(&db, schema)
 }
@@ -858,6 +1136,11 @@ fn first_positional(args: &[String]) -> Option<&String> {
 fn required_path(arg: Option<&String>, command: &str) -> Result<PathBuf, String> {
     arg.map(PathBuf::from)
         .ok_or_else(|| format!("usage: devdrop {command} <path>"))
+}
+
+fn required_arg<'a>(arg: Option<&'a String>, command: &str) -> Result<&'a str, String> {
+    arg.map(String::as_str)
+        .ok_or_else(|| format!("usage: devdrop {command} <id>"))
 }
 
 fn require_dir(path: &Path) -> Result<(), String> {
@@ -2294,6 +2577,13 @@ fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn now_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
         .unwrap_or(0)
 }
 
