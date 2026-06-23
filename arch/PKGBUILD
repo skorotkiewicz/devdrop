@@ -6,7 +6,7 @@ pkgdesc="Local-first workspace sync for developers"
 arch=('x86_64' 'aarch64')
 url="https://github.com/skorotkiewicz/devdrop"
 license=('MIT')
-depends=('gcc-libs')
+depends=('gcc-libs' 'git' 'sqlite' 'openssl')
 makedepends=()
 options=(!strip)
 
