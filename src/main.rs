@@ -249,7 +249,7 @@ fn cmd_agent_finish(id: &str, accept: bool) -> Result<(), String> {
     let (root, agent) = find_agent(id)?;
     ensure_agent_pending(&agent)?;
     if accept {
-        copy_tree(Path::new(&agent.overlay_path), Path::new(&agent.repo_path))?;
+        sync_tree(Path::new(&agent.overlay_path), Path::new(&agent.repo_path))?;
     }
     let status = if accept { "accepted" } else { "rejected" };
     update_agent_status(&root, id, status)?;
@@ -928,6 +928,44 @@ fn copy_tree(src: &Path, dest: &Path) -> Result<(), String> {
     copy_tree_inner(src, dest, src)
 }
 
+fn sync_tree(src: &Path, dest: &Path) -> Result<(), String> {
+    require_dir(src)?;
+    fs::create_dir_all(dest).map_err(|err| format!("create {}: {err}", display_path(dest)))?;
+    prune_missing(src, dest, dest)?;
+    copy_tree(src, dest)
+}
+
+fn prune_missing(src_root: &Path, dest_root: &Path, current_dest: &Path) -> Result<(), String> {
+    for entry in fs::read_dir(current_dest)
+        .map_err(|err| format!("read {}: {err}", display_path(current_dest)))?
+    {
+        let entry = entry.map_err(|err| format!("read {}: {err}", display_path(current_dest)))?;
+        let dest = entry.path();
+        let rel = dest
+            .strip_prefix(dest_root)
+            .map_err(|err| format!("relative path: {err}"))?;
+        if skip_overlay_component(rel) {
+            continue;
+        }
+        let src = src_root.join(rel);
+        let file_type = entry
+            .file_type()
+            .map_err(|err| format!("stat {}: {err}", display_path(&dest)))?;
+        if !src.exists() {
+            if file_type.is_dir() {
+                fs::remove_dir_all(&dest)
+                    .map_err(|err| format!("remove {}: {err}", display_path(&dest)))?;
+            } else {
+                fs::remove_file(&dest)
+                    .map_err(|err| format!("remove {}: {err}", display_path(&dest)))?;
+            }
+        } else if file_type.is_dir() {
+            prune_missing(src_root, dest_root, &dest)?;
+        }
+    }
+    Ok(())
+}
+
 fn copy_tree_inner(root: &Path, dest_root: &Path, current: &Path) -> Result<(), String> {
     for entry in
         fs::read_dir(current).map_err(|err| format!("read {}: {err}", display_path(current)))?
@@ -937,10 +975,7 @@ fn copy_tree_inner(root: &Path, dest_root: &Path, current: &Path) -> Result<(), 
         let rel = src
             .strip_prefix(root)
             .map_err(|err| format!("relative path: {err}"))?;
-        if rel.components().next().is_some_and(|part| {
-            let part = part.as_os_str();
-            part == ".git" || part == ".devdrop"
-        }) {
+        if skip_overlay_component(rel) {
             continue;
         }
         let dest = dest_root.join(rel);
@@ -960,6 +995,13 @@ fn copy_tree_inner(root: &Path, dest_root: &Path, current: &Path) -> Result<(), 
         }
     }
     Ok(())
+}
+
+fn skip_overlay_component(rel: &Path) -> bool {
+    rel.components().next().is_some_and(|part| {
+        let part = part.as_os_str();
+        part == ".git" || part == ".devdrop"
+    })
 }
 
 fn fetch_remote_object(root: &Path, hash: &str) -> Result<(), String> {
