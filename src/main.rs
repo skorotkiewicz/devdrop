@@ -381,6 +381,25 @@ fn cmd_agent_finish(id: &str, accept: bool) -> Result<(), String> {
     let (root, agent) = find_agent(id)?;
     ensure_agent_reviewable(&agent)?;
     if accept {
+        let violations = agent_scope_violations(&agent)?;
+        if !violations.is_empty() {
+            log_operation(
+                &root,
+                "agent_accept_denied",
+                &agent.repo_path,
+                &format!(
+                    "{{\"agent\":{},\"path\":{}}}",
+                    json_string(id),
+                    json_string(&violations[0])
+                ),
+                "blocked",
+            )?;
+            return Err(format!(
+                "overlay changes outside write scope `{}`: {}",
+                agent.write_scope,
+                violations.join(", ")
+            ));
+        }
         sync_tree(Path::new(&agent.overlay_path), Path::new(&agent.repo_path))?;
     }
     let status = if accept { "accepted" } else { "rejected" };
@@ -1412,6 +1431,90 @@ fn ensure_agent_reviewable(agent: &AgentRow) -> Result<(), String> {
     } else {
         Err(format!("agent {} is {}", agent.id, agent.status))
     }
+}
+
+// ponytail: full tree scan at accept time; use indexed overlay diffs when repos get large.
+fn agent_scope_violations(agent: &AgentRow) -> Result<Vec<String>, String> {
+    let repo = tree_signature(Path::new(&agent.repo_path))?;
+    let overlay = tree_signature(Path::new(&agent.overlay_path))?;
+    let mut paths = repo
+        .keys()
+        .chain(overlay.keys())
+        .cloned()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    paths.sort();
+
+    Ok(paths
+        .into_iter()
+        .filter(|path| repo.get(path) != overlay.get(path))
+        .filter(|path| {
+            let is_dir = repo
+                .get(path)
+                .or_else(|| overlay.get(path))
+                .is_some_and(|entry| entry == "dir");
+            !write_scope_allows(&agent.write_scope, path, is_dir)
+        })
+        .collect())
+}
+
+fn write_scope_allows(scope: &str, rel: &str, is_dir: bool) -> bool {
+    scope
+        .split(',')
+        .flat_map(str::split_whitespace)
+        .filter(|pattern| !pattern.is_empty())
+        .any(|pattern| {
+            pattern == "*"
+                || pattern == "**"
+                || pattern.strip_suffix("/**").is_some_and(|prefix| {
+                    rel == prefix
+                        || rel
+                            .strip_prefix(prefix)
+                            .is_some_and(|rest| rest.starts_with('/'))
+                })
+                || Rule::new(pattern, Action::Sync).matches(rel, is_dir)
+        })
+}
+
+fn tree_signature(root: &Path) -> Result<HashMap<String, String>, String> {
+    require_dir(root)?;
+    let mut signature = HashMap::new();
+    collect_tree_signature(root, root, &mut signature)?;
+    Ok(signature)
+}
+
+fn collect_tree_signature(
+    root: &Path,
+    current: &Path,
+    signature: &mut HashMap<String, String>,
+) -> Result<(), String> {
+    for entry in
+        fs::read_dir(current).map_err(|err| format!("read {}: {err}", display_path(current)))?
+    {
+        let entry = entry.map_err(|err| format!("read {}: {err}", display_path(current)))?;
+        let path = entry.path();
+        let rel = path
+            .strip_prefix(root)
+            .map_err(|err| format!("relative path: {err}"))?;
+        if skip_overlay_component(rel) {
+            continue;
+        }
+        let rel = rel_path(root, &path);
+        let file_type = entry
+            .file_type()
+            .map_err(|err| format!("stat {}: {err}", display_path(&path)))?;
+        if file_type.is_dir() {
+            signature.insert(rel, "dir".to_string());
+            collect_tree_signature(root, &path, signature)?;
+        } else if file_type.is_file() {
+            let (hash, size) = file_hash(&path)?;
+            signature.insert(rel, format!("file:{hash}:{size}"));
+        } else {
+            signature.insert(rel, "other".to_string());
+        }
+    }
+    Ok(())
 }
 
 fn copy_tree(src: &Path, dest: &Path) -> Result<(), String> {
@@ -3461,5 +3564,40 @@ PLAIN=value
         let warning = stale_repo_warning(Path::new("/tmp/work/api"), &status).unwrap();
 
         assert!(warning.contains("3 commits behind origin/main"));
+    }
+
+    #[test]
+    fn write_scope_double_star_includes_root_directory() {
+        assert!(write_scope_allows("src/**", "src", true));
+        assert!(write_scope_allows("src/**", "src/lib.rs", false));
+        assert!(!write_scope_allows("src/**", "tests/lib.rs", false));
+    }
+
+    #[test]
+    fn agent_scope_violations_report_out_of_scope_changes() {
+        let root = env::temp_dir().join(format!("devdrop-test-{}", now_nanos()));
+        let repo = root.join("repo");
+        let overlay = root.join("overlay");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src/app.rs"), "one\n").unwrap();
+        fs::write(repo.join("README.md"), "docs\n").unwrap();
+        copy_tree(&repo, &overlay).unwrap();
+        fs::write(overlay.join("src/app.rs"), "two\n").unwrap();
+        fs::write(overlay.join("README.md"), "changed\n").unwrap();
+
+        let agent = AgentRow {
+            id: "agent_test".into(),
+            repo_path: repo.to_string_lossy().into_owned(),
+            overlay_path: overlay.to_string_lossy().into_owned(),
+            write_scope: "src/**".into(),
+            secret_scope: String::new(),
+            status: "pending".into(),
+        };
+
+        assert_eq!(
+            agent_scope_violations(&agent).unwrap(),
+            vec!["README.md".to_string()]
+        );
+        fs::remove_dir_all(root).ok();
     }
 }
