@@ -1387,20 +1387,40 @@ fn device_count(root: &Path) -> Result<usize, String> {
 }
 
 fn push_remote_devices(root: &Path, remote: &Path) -> Result<(), String> {
-    let mut out = File::create(remote_devices_path(remote))
-        .map_err(|err| format!("write remote devices manifest: {err}"))?;
-    writeln!(out, "devdrop-devices-v1").map_err(|err| format!("write devices manifest: {err}"))?;
+    let manifest_path = remote_devices_path(remote);
 
-    let db = db_path(root);
-    if !db.exists() {
-        return Ok(());
+    let mut lines_to_write = Vec::new();
+
+    if manifest_path.exists() {
+        let text = fs::read_to_string(&manifest_path)
+            .map_err(|err| format!("read devices manifest: {err}"))?;
+        let mut lines = text.lines();
+        if lines.next() == Some("devdrop-devices-v1") {
+            for line in lines {
+                lines_to_write.push(line.to_string());
+            }
+        }
     }
 
-    for row in query_lines(
-        &db,
-        "SELECT hex(id)||char(9)||hex(user_id)||char(9)||hex(name)||char(9)||hex(os)||char(9)||hex(arch)||char(9)||hex(trust_level)||char(9)||last_seen_at||char(9)||hex(public_key) FROM devices ORDER BY id;",
-    )? {
-        writeln!(out, "{row}").map_err(|err| format!("write devices manifest: {err}"))?;
+    let db = db_path(root);
+    if db.exists() {
+        for row in query_lines(
+            &db,
+            "SELECT hex(id)||char(9)||hex(user_id)||char(9)||hex(name)||char(9)||hex(os)||char(9)||hex(arch)||char(9)||hex(trust_level)||char(9)||last_seen_at||char(9)||hex(public_key) FROM devices ORDER BY id;",
+        )? {
+            if let Some(id_hex) = row.split('\t').next() {
+                // Remove old remote line if it exists
+                lines_to_write.retain(|l| l.split('\t').next() != Some(id_hex));
+                lines_to_write.push(row);
+            }
+        }
+    }
+
+    let mut out = File::create(&manifest_path)
+        .map_err(|err| format!("write remote devices manifest: {err}"))?;
+    writeln!(out, "devdrop-devices-v1").map_err(|err| format!("write devices manifest: {err}"))?;
+    for line in lines_to_write {
+        writeln!(out, "{line}").map_err(|err| format!("write devices manifest: {err}"))?;
     }
 
     Ok(())
@@ -2150,40 +2170,64 @@ fn lookup_secret(root: &Path, rel: &str, scope: &str) -> Result<SecretRow, Strin
 }
 
 fn push_remote_secrets(root: &Path, remote: &Path) -> Result<(), String> {
-    let db = db_path(root);
-    let mut out = File::create(remote.join("secrets.tsv"))
-        .map_err(|err| format!("write remote secrets manifest: {err}"))?;
-    writeln!(out, "devdrop-secrets-v1").map_err(|err| format!("write secrets manifest: {err}"))?;
-    if !db.exists() {
-        return Ok(());
+    let manifest_path = remote.join("secrets.tsv");
+
+    let mut lines_to_write = Vec::new();
+
+    if manifest_path.exists() {
+        let text = fs::read_to_string(&manifest_path)
+            .map_err(|err| format!("read secrets manifest: {err}"))?;
+        let mut lines = text.lines();
+        if lines.next() == Some("devdrop-secrets-v1") {
+            for line in lines {
+                lines_to_write.push(line.to_string());
+            }
+        }
     }
 
-    for row in query_lines(
-        &db,
-        "SELECT hex(path)||char(9)||hex(scope)||char(9)||hex(encrypted_path) FROM secrets ORDER BY path, scope;",
-    )? {
-        let fields = row.split('\t').collect::<Vec<_>>();
-        if fields.len() != 3 {
-            continue;
+    let db = db_path(root);
+    if db.exists() {
+        for row in query_lines(
+            &db,
+            "SELECT hex(path)||char(9)||hex(scope)||char(9)||hex(encrypted_path) FROM secrets ORDER BY path, scope;",
+        )? {
+            let fields = row.split('\t').collect::<Vec<_>>();
+            if fields.len() != 3 {
+                continue;
+            }
+            let key = format!("{}:{}", fields[0], fields[1]);
+
+            // Remove old remote line if exists
+            lines_to_write.retain(|l| {
+                let lf = l.split('\t').collect::<Vec<_>>();
+                lf.len() == 3 && format!("{}:{}", lf[0], lf[1]) != key
+            });
+
+            let rel = hex_decode_string(fields[0])?;
+            let scope = hex_decode_string(fields[1])?;
+            let encrypted = PathBuf::from(hex_decode_string(fields[2])?);
+            let name = secret_cipher_path(remote, &rel, &scope)
+                .file_name()
+                .ok_or_else(|| "secret filename".to_string())?
+                .to_string_lossy()
+                .into_owned();
+            fs::copy(&encrypted, remote_secrets_path(remote).join(&name))
+                .map_err(|err| format!("copy remote secret {rel}: {err}"))?;
+
+            lines_to_write.push(format!(
+                "{}\t{}\t{}",
+                hex_encode(rel.as_bytes()),
+                hex_encode(scope.as_bytes()),
+                hex_encode(name.as_bytes())
+            ));
         }
-        let rel = hex_decode_string(fields[0])?;
-        let scope = hex_decode_string(fields[1])?;
-        let encrypted = PathBuf::from(hex_decode_string(fields[2])?);
-        let name = secret_cipher_path(remote, &rel, &scope)
-            .file_name()
-            .ok_or_else(|| "secret filename".to_string())?
-            .to_string_lossy()
-            .into_owned();
-        fs::copy(&encrypted, remote_secrets_path(remote).join(&name))
-            .map_err(|err| format!("copy remote secret {rel}: {err}"))?;
-        writeln!(
-            out,
-            "{}\t{}\t{}",
-            hex_encode(rel.as_bytes()),
-            hex_encode(scope.as_bytes()),
-            hex_encode(name.as_bytes())
-        )
-        .map_err(|err| format!("write secrets manifest: {err}"))?;
+    }
+
+    let mut out = File::create(&manifest_path)
+        .map_err(|err| format!("write remote secrets manifest: {err}"))?;
+    writeln!(out, "devdrop-secrets-v1").map_err(|err| format!("write secrets manifest: {err}"))?;
+    for line in lines_to_write {
+        writeln!(out, "{line}").map_err(|err| format!("write secrets manifest: {err}"))?;
     }
     Ok(())
 }
@@ -3088,11 +3132,53 @@ DELETE FROM repo_status;
 fn push_remote(root: &Path, remote: &Path, snapshot: &IndexSnapshot) -> Result<(), String> {
     init_remote_storage(remote)?;
 
+    let existing_remote = read_remote_manifest(remote)?;
+    let local_paths = snapshot
+        .nodes
+        .iter()
+        .map(|n| n.path.clone())
+        .collect::<HashSet<_>>();
+
+    // Get local tombstones to know what to delete from the remote manifest
+    let local_tombstones = if db_path(root).exists() {
+        query_lines(
+            &db_path(root),
+            "SELECT path FROM tombstones WHERE workspace_id='local';",
+        )?
+        .into_iter()
+        .collect::<HashSet<_>>()
+    } else {
+        HashSet::new()
+    };
+
     let mut manifest = File::create(remote_manifest_path(remote))
         .map_err(|err| format!("write remote manifest: {err}"))?;
     writeln!(manifest, "devdrop-manifest-v1").map_err(|err| format!("write manifest: {err}"))?;
 
+    // First, write all local nodes (they take precedence over existing remote nodes)
     for node in snapshot.nodes.iter().filter(|node| remote_node(node)) {
+        writeln!(
+            manifest,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            hex_encode(node.path.as_bytes()),
+            node.kind,
+            node.mode,
+            node.size,
+            node.content_hash.as_deref().unwrap_or(""),
+            node.local_state,
+            node.local_mtime
+        )
+        .map_err(|err| format!("write manifest: {err}"))?;
+    }
+
+    // Then, write remote nodes that are not local and not tombstoned
+    for node in &existing_remote {
+        if local_paths.contains(&node.path) {
+            continue; // Already handled by local snapshot
+        }
+        if local_tombstones.contains(&node.path) {
+            continue; // Deleted locally, drop from remote
+        }
         writeln!(
             manifest,
             "{}\t{}\t{}\t{}\t{}\t{}\t{}",
@@ -3265,20 +3351,50 @@ struct RemoteTombstone {
 }
 
 fn push_remote_tombstones(root: &Path, remote: &Path) -> Result<(), String> {
-    let mut out = File::create(remote_tombstones_path(remote))
-        .map_err(|err| format!("write remote tombstones: {err}"))?;
-    writeln!(out, "devdrop-tombstones-v1").map_err(|err| format!("write tombstones: {err}"))?;
+    let manifest_path = remote_tombstones_path(remote);
 
-    let db = db_path(root);
-    if !db.exists() {
-        return Ok(());
+    let mut lines_to_write = Vec::new();
+    let mut existing_keys = HashSet::new();
+
+    if manifest_path.exists() {
+        let text =
+            fs::read_to_string(&manifest_path).map_err(|err| format!("read tombstones: {err}"))?;
+        let mut lines = text.lines();
+        if lines.next() == Some("devdrop-tombstones-v1") {
+            for line in lines {
+                let fields = line.split('\t').collect::<Vec<_>>();
+                if fields.len() == 3 {
+                    let key = format!("{}:{}", fields[0], fields[1]);
+                    if existing_keys.insert(key) {
+                        lines_to_write.push(line.to_string());
+                    }
+                }
+            }
+        }
     }
 
-    for row in query_lines(
-        &db,
-        "SELECT hex(path)||char(9)||ifnull(hex(content_hash),'')||char(9)||deleted_at FROM tombstones ORDER BY deleted_at, path;",
-    )? {
-        writeln!(out, "{row}").map_err(|err| format!("write tombstones: {err}"))?;
+    let db = db_path(root);
+    if db.exists() {
+        for row in query_lines(
+            &db,
+            "SELECT hex(path)||char(9)||ifnull(hex(content_hash),'')||char(9)||deleted_at FROM tombstones ORDER BY deleted_at, path;",
+        )? {
+            let fields = row.split('\t').collect::<Vec<_>>();
+            if fields.len() != 3 {
+                continue;
+            }
+            let key = format!("{}:{}", fields[0], fields[1]);
+            if existing_keys.insert(key) {
+                lines_to_write.push(row);
+            }
+        }
+    }
+
+    let mut out =
+        File::create(&manifest_path).map_err(|err| format!("write remote tombstones: {err}"))?;
+    writeln!(out, "devdrop-tombstones-v1").map_err(|err| format!("write tombstones: {err}"))?;
+    for line in lines_to_write {
+        writeln!(out, "{line}").map_err(|err| format!("write tombstones: {err}"))?;
     }
 
     Ok(())
@@ -3375,8 +3491,12 @@ struct RemoteNode {
 }
 
 fn read_remote_manifest(remote: &Path) -> Result<Vec<RemoteNode>, String> {
-    let text = fs::read_to_string(remote_manifest_path(remote))
-        .map_err(|err| format!("read remote manifest: {err}"))?;
+    let path = remote_manifest_path(remote);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let text = fs::read_to_string(&path).map_err(|err| format!("read remote manifest: {err}"))?;
     let mut lines = text.lines();
     if lines.next() != Some("devdrop-manifest-v1") {
         return Err("unsupported remote manifest".into());
