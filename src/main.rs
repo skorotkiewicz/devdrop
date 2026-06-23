@@ -28,9 +28,10 @@ fn run() -> Result<(), String> {
         }
         Some("workspace") => cmd_workspace(&args[1..]),
         Some("repo") => cmd_repo(&args[1..]),
+        Some("remote") => cmd_remote(&args[1..]),
         Some("secret") => cmd_secret(&args[1..]),
         Some("run") => cmd_run(&args[1..]),
-        Some("sync") => cmd_sync(optional_path(args.get(1))?),
+        Some("sync") => cmd_sync(&args[1..]),
         Some("status") => cmd_status(optional_path(args.get(1))?),
         Some("ls") => cmd_ls(optional_path(args.get(1))?),
         Some("ignored") => cmd_ignored(optional_path(args.get(1))?),
@@ -52,11 +53,12 @@ devdrop - local-first workspace helper
 Usage:
   devdrop workspace init <path>
   devdrop repo update [path]
+  devdrop remote init <path>
   devdrop secret add <path> --scope <scope>
   devdrop secret unlock <path> [--scope <scope>]
   devdrop secret lock <path> [--scope <scope>]
   devdrop run --repo <path> --secret-scope <scope> -- <command>
-  devdrop sync [path]
+  devdrop sync [path] [--remote <path>] [--pull]
   devdrop status [path]
   devdrop ls [path]
   devdrop ignored [path]
@@ -96,6 +98,18 @@ fn cmd_repo(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         _ => Err("usage: devdrop repo update [path]".into()),
+    }
+}
+
+fn cmd_remote(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("init") => {
+            let path = required_path(args.get(1), "remote init")?;
+            init_remote_storage(&path)?;
+            println!("remote initialized: {}", display_path(&path));
+            Ok(())
+        }
+        _ => Err("usage: devdrop remote init <path>".into()),
     }
 }
 
@@ -219,11 +233,27 @@ fn cmd_secret_lock(path: &Path, scope: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_sync(root: PathBuf) -> Result<(), String> {
+fn cmd_sync(args: &[String]) -> Result<(), String> {
+    let root = optional_path(first_positional(args))?;
     let root = workspace_root_for(&root)?;
-    let rules = Rules::load(&root)?;
-    let snapshot = collect_index(&root, &rules)?;
-    write_index(&root, &rules, &snapshot)?;
+    let remote = flag_value(args, "--remote")
+        .map(PathBuf::from)
+        .or_else(|| read_remote_config(&root).ok().flatten());
+
+    if args.iter().any(|arg| arg == "--pull") {
+        let remote = remote.ok_or_else(|| "sync --pull requires --remote <path>".to_string())?;
+        pull_remote(&root, &remote)?;
+        write_remote_config(&root, &remote)?;
+        println!("pulled remote manifest: {}", display_path(&remote));
+        return Ok(());
+    }
+
+    let snapshot = sync_local_index(&root)?;
+    if let Some(remote) = remote {
+        push_remote(&root, &remote, &snapshot)?;
+        write_remote_config(&root, &remote)?;
+        println!("pushed remote manifest: {}", display_path(&remote));
+    }
 
     println!("synced local index: {}", display_path(&root));
     println!("nodes: {}", snapshot.nodes.len());
@@ -232,12 +262,20 @@ fn cmd_sync(root: PathBuf) -> Result<(), String> {
     Ok(())
 }
 
+fn sync_local_index(root: &Path) -> Result<IndexSnapshot, String> {
+    let rules = Rules::load(root)?;
+    let snapshot = collect_index(root, &rules)?;
+    write_index(root, &rules, &snapshot)?;
+    Ok(snapshot)
+}
+
 fn cmd_status(root: PathBuf) -> Result<(), String> {
     require_dir(&root)?;
 
     let rules = Rules::load(&root)?;
     let mut counts = scan_workspace(&root, &rules)?;
     counts.secret_locked += locked_secret_count(&root).unwrap_or(0);
+    counts.remote_only += indexed_state_count(&root, "remote-only").unwrap_or(0);
     let pins = read_pins(&root).unwrap_or_default();
     let index = if db_path(&root).exists() {
         "present"
@@ -300,6 +338,17 @@ fn cmd_ls(root: PathBuf) -> Result<(), String> {
     for name in locked_secrets_in_dir(&root)? {
         if visible_names.insert(name.clone()) {
             println!("{:<13} {}", "secret-locked", name);
+        }
+    }
+
+    for entry in indexed_entries_in_dir(&root)? {
+        if visible_names.insert(entry.name.clone()) {
+            let slash = if entry.kind == "directory" || entry.kind == "repo" {
+                "/"
+            } else {
+                ""
+            };
+            println!("{:<13} {}{}", entry.state, entry.name, slash);
         }
     }
 
@@ -485,6 +534,16 @@ fn init_workspace_storage(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn init_remote_storage(remote: &Path) -> Result<(), String> {
+    fs::create_dir_all(remote_manifest_dir(remote))
+        .map_err(|err| format!("create remote manifest dir: {err}"))?;
+    fs::create_dir_all(remote_objects_path(remote))
+        .map_err(|err| format!("create remote object dir: {err}"))?;
+    fs::create_dir_all(remote_secrets_path(remote))
+        .map_err(|err| format!("create remote secret dir: {err}"))?;
+    Ok(())
+}
+
 fn workspace_root_for(path: &Path) -> Result<PathBuf, String> {
     require_dir(path)?;
     find_workspace_root(path).ok_or_else(|| {
@@ -501,6 +560,80 @@ fn db_path(root: &Path) -> PathBuf {
 
 fn object_store_path(root: &Path) -> PathBuf {
     root.join(".devdrop/objects")
+}
+
+fn remote_config_path(root: &Path) -> PathBuf {
+    root.join(".devdrop/remote")
+}
+
+fn remote_manifest_dir(remote: &Path) -> PathBuf {
+    remote.join("manifests")
+}
+
+fn remote_manifest_path(remote: &Path) -> PathBuf {
+    remote_manifest_dir(remote).join("latest.tsv")
+}
+
+fn remote_objects_path(remote: &Path) -> PathBuf {
+    remote.join("objects")
+}
+
+fn remote_object_path(remote: &Path, hash: &str) -> PathBuf {
+    remote_objects_path(remote).join(hash.replace(':', "_"))
+}
+
+fn remote_secrets_path(remote: &Path) -> PathBuf {
+    remote.join("secrets")
+}
+
+fn write_remote_config(root: &Path, remote: &Path) -> Result<(), String> {
+    fs::write(
+        remote_config_path(root),
+        remote.to_string_lossy().as_bytes(),
+    )
+    .map_err(|err| format!("write remote config: {err}"))
+}
+
+fn read_remote_config(root: &Path) -> Result<Option<PathBuf>, String> {
+    let path = remote_config_path(root);
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let text = fs::read_to_string(&path).map_err(|err| format!("read remote config: {err}"))?;
+    let text = text.trim();
+    Ok((!text.is_empty()).then(|| PathBuf::from(text)))
+}
+
+fn fetch_remote_object(root: &Path, hash: &str) -> Result<(), String> {
+    let remote = read_remote_config(root)?
+        .ok_or_else(|| format!("object {hash} is not local and no remote is configured"))?;
+    let src = remote_object_path(&remote, hash);
+    if !src.exists() {
+        return Err(format!("remote object missing: {}", display_path(&src)));
+    }
+    fs::create_dir_all(object_store_path(root))
+        .map_err(|err| format!("create object store: {err}"))?;
+    fs::copy(&src, object_path(root, hash))
+        .map_err(|err| format!("copy remote object {hash}: {err}"))?;
+    Ok(())
+}
+
+fn mark_node_local(root: &Path, rel: &str) -> Result<(), String> {
+    let db = db_path(root);
+    if !db.exists() {
+        return Ok(());
+    }
+    run_sql(
+        &db,
+        &format!(
+            "UPDATE nodes SET local_state='local' WHERE workspace_id='local' AND path={};
+UPDATE blobs SET present=1 WHERE hash=(SELECT content_hash FROM nodes WHERE workspace_id='local' AND path={});
+",
+            sql_string(rel),
+            sql_string(rel)
+        ),
+    )
 }
 
 fn init_db(root: &Path) -> Result<(), String> {
@@ -595,16 +728,14 @@ fn hydrate_from_local_store(path: &Path) -> Result<(), String> {
         .ok_or_else(|| format!("no indexed blob for {}", display_path(path)))?;
     let object = object_path(&root, &hash);
     if !object.exists() {
-        return Err(format!(
-            "indexed blob is missing from local object store: {}",
-            display_path(&object)
-        ));
+        fetch_remote_object(&root, &hash)?;
     }
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| format!("create parent dir: {err}"))?;
     }
     fs::copy(&object, path).map_err(|err| format!("hydrate {}: {err}", display_path(path)))?;
+    mark_node_local(&root, &rel)?;
     log_operation(&root, "hydrate", &rel, "{}", "done")?;
     println!("hydrated: {}", display_path(path));
     Ok(())
@@ -614,6 +745,23 @@ fn optional_path(arg: Option<&String>) -> Result<PathBuf, String> {
     arg.map(PathBuf::from)
         .map(Ok)
         .unwrap_or_else(|| env::current_dir().map_err(|err| format!("current dir: {err}")))
+}
+
+fn first_positional(args: &[String]) -> Option<&String> {
+    let mut skip_next = false;
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        match arg.as_str() {
+            "--remote" => skip_next = true,
+            "--pull" => {}
+            _ if arg.starts_with("--") => {}
+            _ => return Some(arg),
+        }
+    }
+    None
 }
 
 fn required_path(arg: Option<&String>, command: &str) -> Result<PathBuf, String> {
@@ -693,6 +841,12 @@ struct SecretRow {
     encrypted_path: PathBuf,
 }
 
+struct IndexedEntry {
+    name: String,
+    state: String,
+    kind: String,
+}
+
 fn secret_store_path(root: &Path) -> PathBuf {
     root.join(".devdrop/secrets")
 }
@@ -759,6 +913,74 @@ fn lookup_secret(root: &Path, rel: &str, scope: &str) -> Result<SecretRow, Strin
     })
 }
 
+fn push_remote_secrets(root: &Path, remote: &Path) -> Result<(), String> {
+    let db = db_path(root);
+    let mut out = File::create(remote.join("secrets.tsv"))
+        .map_err(|err| format!("write remote secrets manifest: {err}"))?;
+    writeln!(out, "devdrop-secrets-v1").map_err(|err| format!("write secrets manifest: {err}"))?;
+    if !db.exists() {
+        return Ok(());
+    }
+
+    for row in query_lines(
+        &db,
+        "SELECT hex(path)||char(9)||hex(scope)||char(9)||hex(encrypted_path) FROM secrets ORDER BY path, scope;",
+    )? {
+        let fields = row.split('\t').collect::<Vec<_>>();
+        if fields.len() != 3 {
+            continue;
+        }
+        let rel = hex_decode_string(fields[0])?;
+        let scope = hex_decode_string(fields[1])?;
+        let encrypted = PathBuf::from(hex_decode_string(fields[2])?);
+        let name = secret_cipher_path(remote, &rel, &scope)
+            .file_name()
+            .ok_or_else(|| "secret filename".to_string())?
+            .to_string_lossy()
+            .into_owned();
+        fs::copy(&encrypted, remote_secrets_path(remote).join(&name))
+            .map_err(|err| format!("copy remote secret {rel}: {err}"))?;
+        writeln!(
+            out,
+            "{}\t{}\t{}",
+            hex_encode(rel.as_bytes()),
+            hex_encode(scope.as_bytes()),
+            hex_encode(name.as_bytes())
+        )
+        .map_err(|err| format!("write secrets manifest: {err}"))?;
+    }
+    Ok(())
+}
+
+fn pull_remote_secrets(root: &Path, remote: &Path) -> Result<(), String> {
+    let manifest = remote.join("secrets.tsv");
+    if !manifest.exists() {
+        return Ok(());
+    }
+
+    let text =
+        fs::read_to_string(&manifest).map_err(|err| format!("read secrets manifest: {err}"))?;
+    let mut lines = text.lines();
+    if lines.next() != Some("devdrop-secrets-v1") {
+        return Err("unsupported remote secrets manifest".into());
+    }
+
+    for (index, line) in lines.enumerate() {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != 3 {
+            return Err(format!("bad secrets manifest line {}", index + 2));
+        }
+        let rel = hex_decode_string(fields[0])?;
+        let scope = hex_decode_string(fields[1])?;
+        let name = hex_decode_string(fields[2])?;
+        let local = secret_store_path(root).join(&name);
+        fs::copy(remote_secrets_path(remote).join(&name), &local)
+            .map_err(|err| format!("copy pulled secret {rel}: {err}"))?;
+        upsert_secret(root, &rel, &scope, &local, false)?;
+    }
+    Ok(())
+}
+
 fn locked_secret_count(root: &Path) -> Result<usize, String> {
     let db = db_path(root);
     if !db.exists() {
@@ -772,6 +994,24 @@ fn locked_secret_count(root: &Path) -> Result<usize, String> {
     count
         .parse()
         .map_err(|err| format!("parse locked secret count: {err}"))
+}
+
+fn indexed_state_count(root: &Path, state: &str) -> Result<usize, String> {
+    let db = db_path(root);
+    if !db.exists() {
+        return Ok(0);
+    }
+    let count = query_one(
+        &db,
+        &format!(
+            "SELECT count(*) FROM nodes WHERE workspace_id='local' AND local_state={};",
+            sql_string(state)
+        ),
+    )?
+    .unwrap_or_else(|| "0".to_string());
+    count
+        .parse()
+        .map_err(|err| format!("parse indexed state count: {err}"))
 }
 
 fn locked_secrets_in_dir(dir: &Path) -> Result<Vec<String>, String> {
@@ -795,6 +1035,53 @@ fn locked_secrets_in_dir(dir: &Path) -> Result<Vec<String>, String> {
     names.sort();
     names.dedup();
     Ok(names)
+}
+
+fn indexed_entries_in_dir(dir: &Path) -> Result<Vec<IndexedEntry>, String> {
+    let Some(root) = find_workspace_root(dir) else {
+        return Ok(Vec::new());
+    };
+    let db = db_path(&root);
+    if !db.exists() {
+        return Ok(Vec::new());
+    }
+
+    let dir_rel = rel_or_dot(&root, dir);
+    let mut entries = query_lines(
+        &db,
+        "SELECT hex(path)||char(9)||hex(local_state)||char(9)||hex(kind) FROM nodes WHERE workspace_id='local' ORDER BY path;",
+    )?
+    .into_iter()
+    .filter_map(|row| indexed_entry_from_row(&row, &dir_rel).transpose())
+    .collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(entries)
+}
+
+fn indexed_entry_from_row(row: &str, dir_rel: &str) -> Result<Option<IndexedEntry>, String> {
+    let fields = row.split('\t').collect::<Vec<_>>();
+    if fields.len() != 3 {
+        return Ok(None);
+    }
+
+    let path = hex_decode_string(fields[0])?;
+    if path == "." || parent_rel(&path).as_deref() != Some(dir_rel) {
+        return Ok(None);
+    }
+
+    let state = hex_decode_string(fields[1])?;
+    if !matches!(
+        state.as_str(),
+        "remote-only" | "metadata-only" | "secret-locked"
+    ) {
+        return Ok(None);
+    }
+
+    Ok(Some(IndexedEntry {
+        name: path.rsplit('/').next().unwrap_or(&path).to_string(),
+        state,
+        kind: hex_decode_string(fields[2])?,
+    }))
 }
 
 fn secret_env_for_repo(repo: &Path, scope: &str) -> Result<Vec<(String, String)>, String> {
@@ -1387,6 +1674,170 @@ DELETE FROM repo_status;
     run_sql(&db, &sql)
 }
 
+fn push_remote(root: &Path, remote: &Path, snapshot: &IndexSnapshot) -> Result<(), String> {
+    init_remote_storage(remote)?;
+
+    let mut manifest = File::create(remote_manifest_path(remote))
+        .map_err(|err| format!("write remote manifest: {err}"))?;
+    writeln!(manifest, "devdrop-manifest-v1").map_err(|err| format!("write manifest: {err}"))?;
+
+    for node in snapshot.nodes.iter().filter(|node| remote_node(node)) {
+        writeln!(
+            manifest,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            hex_encode(node.path.as_bytes()),
+            node.kind,
+            node.mode,
+            node.size,
+            node.content_hash.as_deref().unwrap_or(""),
+            node.local_state,
+            node.local_mtime
+        )
+        .map_err(|err| format!("write manifest: {err}"))?;
+    }
+
+    for blob in snapshot.blobs.values() {
+        let dest = remote_object_path(remote, &blob.hash);
+        if !dest.exists() {
+            fs::copy(&blob.local_path, &dest)
+                .map_err(|err| format!("copy remote blob {}: {err}", blob.hash))?;
+        }
+    }
+
+    push_remote_secrets(root, remote)?;
+    Ok(())
+}
+
+fn pull_remote(root: &Path, remote: &Path) -> Result<(), String> {
+    init_workspace_storage(root)?;
+    let nodes = read_remote_manifest(remote)?;
+
+    for node in &nodes {
+        if matches!(node.kind.as_str(), "directory" | "repo") && node.path != "." {
+            fs::create_dir_all(root.join(&node.path))
+                .map_err(|err| format!("create {}: {err}", node.path))?;
+        }
+    }
+
+    pull_remote_secrets(root, remote)?;
+    write_pulled_index(root, &nodes)?;
+    Ok(())
+}
+
+fn remote_node(node: &IndexNode) -> bool {
+    !matches!(node.local_state.as_str(), "local-only" | "ignored")
+        && node.path != ".devdrop"
+        && !node.path.starts_with(".devdrop/")
+}
+
+struct RemoteNode {
+    path: String,
+    kind: String,
+    mode: u32,
+    size: u64,
+    content_hash: Option<String>,
+    local_state: String,
+    local_mtime: i64,
+}
+
+fn read_remote_manifest(remote: &Path) -> Result<Vec<RemoteNode>, String> {
+    let text = fs::read_to_string(remote_manifest_path(remote))
+        .map_err(|err| format!("read remote manifest: {err}"))?;
+    let mut lines = text.lines();
+    if lines.next() != Some("devdrop-manifest-v1") {
+        return Err("unsupported remote manifest".into());
+    }
+
+    lines
+        .enumerate()
+        .map(|(index, line)| parse_remote_node(line, index + 2))
+        .collect()
+}
+
+fn parse_remote_node(line: &str, line_no: usize) -> Result<RemoteNode, String> {
+    let fields = line.split('\t').collect::<Vec<_>>();
+    if fields.len() != 7 {
+        return Err(format!("bad manifest line {line_no}"));
+    }
+
+    Ok(RemoteNode {
+        path: String::from_utf8(hex_decode(fields[0])?)
+            .map_err(|err| format!("bad manifest path on line {line_no}: {err}"))?,
+        kind: fields[1].to_string(),
+        mode: fields[2]
+            .parse()
+            .map_err(|err| format!("bad mode on line {line_no}: {err}"))?,
+        size: fields[3]
+            .parse()
+            .map_err(|err| format!("bad size on line {line_no}: {err}"))?,
+        content_hash: (!fields[4].is_empty()).then(|| fields[4].to_string()),
+        local_state: fields[5].to_string(),
+        local_mtime: fields[6]
+            .parse()
+            .map_err(|err| format!("bad mtime on line {line_no}: {err}"))?,
+    })
+}
+
+fn write_pulled_index(root: &Path, nodes: &[RemoteNode]) -> Result<(), String> {
+    init_db(root)?;
+    let db = db_path(root);
+    let now = now_secs();
+    let mut sql = String::from(
+        "
+BEGIN;
+DELETE FROM nodes;
+DELETE FROM blobs;
+DELETE FROM repo_status;
+",
+    );
+
+    for node in nodes {
+        let local_state = pulled_state(node);
+        sql.push_str(&format!(
+            "INSERT OR REPLACE INTO nodes (id, workspace_id, parent_id, path, kind, mode, size, content_hash, local_state, remote_manifest_id, local_mtime, remote_mtime, deleted_at) VALUES ({}, 'local', {}, {}, {}, {}, {}, {}, {}, 'latest', NULL, {}, NULL);\n",
+            sql_string(&node_id(&node.path)),
+            sql_optional(parent_rel(&node.path).as_deref()),
+            sql_string(&node.path),
+            sql_string(&node.kind),
+            node.mode,
+            node.size,
+            sql_optional(node.content_hash.as_deref()),
+            sql_string(local_state),
+            node.local_mtime
+        ));
+
+        if let Some(hash) = &node.content_hash {
+            sql.push_str(&format!(
+                "INSERT OR REPLACE INTO blobs (hash, size, local_path, present, ref_count) VALUES ({}, {}, {}, {}, 1);\n",
+                sql_string(hash),
+                node.size,
+                sql_string(&object_path(root, hash).to_string_lossy()),
+                i32::from(object_path(root, hash).exists())
+            ));
+        }
+    }
+
+    sql.push_str(&operation_sql(
+        "pull",
+        ".",
+        &format!("{{\"nodes\":{}}}", nodes.len()),
+        "done",
+        now,
+    ));
+    sql.push_str("COMMIT;\n");
+    run_sql(&db, &sql)
+}
+
+fn pulled_state(node: &RemoteNode) -> &str {
+    match node.kind.as_str() {
+        "directory" | "repo" => "local",
+        "secret" => "secret-locked",
+        _ if node.local_state == "metadata-only" => "metadata-only",
+        _ if node.content_hash.is_some() => "remote-only",
+        _ => node.local_state.as_str(),
+    }
+}
+
 fn walk_dirs<F>(root: &Path, path: &Path, rules: &Rules, visit: &mut F) -> Result<(), String>
 where
     F: FnMut(&Path, fs::FileType, Action) -> Result<bool, String>,
@@ -1602,6 +2053,40 @@ fn fnv_bytes(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn hex_decode(text: &str) -> Result<Vec<u8>, String> {
+    if !text.len().is_multiple_of(2) {
+        return Err("odd-length hex".into());
+    }
+
+    text.as_bytes()
+        .chunks(2)
+        .map(|chunk| Ok((hex_nibble(chunk[0])? << 4) | hex_nibble(chunk[1])?))
+        .collect()
+}
+
+fn hex_decode_string(text: &str) -> Result<String, String> {
+    String::from_utf8(hex_decode(text)?).map_err(|err| format!("bad utf-8 hex: {err}"))
+}
+
+fn hex_nibble(byte: u8) -> Result<u8, String> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(format!("invalid hex byte: {}", byte as char)),
+    }
 }
 
 fn run_sql(db: &Path, sql: &str) -> Result<(), String> {
