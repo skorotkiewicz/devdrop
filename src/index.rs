@@ -687,26 +687,9 @@ fn modified_secs(metadata: &fs::Metadata) -> i64 {
 }
 
 pub fn file_hash(path: &Path) -> Result<(String, u64), String> {
-    let mut file = File::open(path).map_err(|err| format!("read {}: {err}", display_path(path)))?;
-    let mut hash = 0xcbf29ce484222325u64;
-    let mut size = 0;
-    let mut buf = [0u8; 32 * 1024];
-
-    loop {
-        let read = file
-            .read(&mut buf)
-            .map_err(|err| format!("read {}: {err}", display_path(path)))?;
-        if read == 0 {
-            break;
-        }
-
-        size += read as u64;
-        for byte in &buf[..read] {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-    }
-
+    let bytes = fs::read(path).map_err(|err| format!("read {}: {err}", display_path(path)))?;
+    let size = bytes.len() as u64;
+    let hash = fnv_bytes(&bytes);
     Ok((format!("fnv1a64:{hash:016x}"), size))
 }
 

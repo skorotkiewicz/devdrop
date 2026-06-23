@@ -12,8 +12,8 @@ use std::path::PathBuf;
 
 pub fn run(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
-        Some("help") if args.get(1).map(String::as_str) == Some("advanced") => {
-            print_advanced_help();
+        Some("help") if args.get(1).map(String::as_str) == Some("more") => {
+            print_more_help();
             Ok(())
         }
         None | Some("help") | Some("-h") | Some("--help") => {
@@ -58,14 +58,14 @@ Usage:
   devdrop sync [path] [--remote <path>] [--pull]
   devdrop run --repo <path> [--secret-scope <scope>] -- <command>
   devdrop agent create --repo <path> [--write-scope <scope>] [--secret-scope <scope>]
-  devdrop help advanced"
+  devdrop help more"
     );
 }
 
-fn print_advanced_help() {
+fn print_more_help() {
     println!(
         "\
-devdrop - advanced commands
+devdrop - more commands
 
 Usage:
   devdrop init [path] [--remote <path>]

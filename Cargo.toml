@@ -2,8 +2,7 @@
 name = "devdrop"
 version = "0.1.1"
 edition = "2024"
-
-[dependencies]
+# yes, no external dependencies at all, yet, or ever.
 
 [profile.release]
 lto = true
