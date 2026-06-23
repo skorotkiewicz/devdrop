@@ -27,7 +27,9 @@ fn run() -> Result<(), String> {
             print_help();
             Ok(())
         }
+        Some("login") => cmd_login(args.get(1)),
         Some("workspace") => cmd_workspace(&args[1..]),
+        Some("device") => cmd_device(&args[1..]),
         Some("repo") => cmd_repo(&args[1..]),
         Some("remote") => cmd_remote(&args[1..]),
         Some("secret") => cmd_secret(&args[1..]),
@@ -56,7 +58,10 @@ fn print_help() {
 devdrop - local-first workspace helper
 
 Usage:
+  devdrop login [user]
   devdrop workspace init <path>
+  devdrop device enroll <name>
+  devdrop device list
   devdrop repo update [path]
   devdrop remote init <path>
   devdrop secret add <path> --scope <scope>
@@ -85,6 +90,27 @@ Usage:
     );
 }
 
+fn cmd_login(user: Option<&String>) -> Result<(), String> {
+    let cwd = env::current_dir().map_err(|err| format!("current dir: {err}"))?;
+    let root = find_workspace_root(&cwd).unwrap_or(cwd);
+    init_workspace_storage(&root)?;
+    let user = user
+        .cloned()
+        .or_else(|| env::var("USER").ok())
+        .unwrap_or_else(|| "local".to_string());
+    init_db(&root)?;
+    upsert_user(&root, &user)?;
+    log_operation(
+        &root,
+        "login",
+        ".",
+        &format!("{{\"user\":{}}}", json_string(&user)),
+        "done",
+    )?;
+    println!("logged in: {user}");
+    Ok(())
+}
+
 fn cmd_workspace(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("init") | Some("mount") => {
@@ -95,6 +121,87 @@ fn cmd_workspace(args: &[String]) -> Result<(), String> {
         }
         _ => Err("usage: devdrop workspace init <path>".into()),
     }
+}
+
+fn cmd_device(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("enroll") => {
+            let name = required_arg(args.get(1), "device enroll")?;
+            cmd_device_enroll(name)
+        }
+        Some("list") => cmd_device_list(),
+        _ => Err("usage: devdrop device enroll <name> | devdrop device list".into()),
+    }
+}
+
+fn cmd_device_enroll(name: &str) -> Result<(), String> {
+    let root = env::current_dir()
+        .map_err(|err| format!("current dir: {err}"))
+        .ok()
+        .and_then(|dir| find_workspace_root(&dir))
+        .ok_or_else(|| "no .devdrop workspace found; run inside a workspace".to_string())?;
+    init_db(&root)?;
+    let user = current_user(&root)?.unwrap_or_else(|| "local".to_string());
+    upsert_user(&root, &user)?;
+    let id = format!(
+        "device_{:016x}",
+        fnv_bytes(format!("{user}:{name}").as_bytes())
+    );
+    let public_key = format!(
+        "local-pub-{:016x}",
+        fnv_bytes(format!("{id}:{}", now_nanos()).as_bytes())
+    );
+    let now = now_secs();
+    run_sql(
+        &db_path(&root),
+        &format!(
+            "INSERT OR REPLACE INTO devices (id, workspace_id, user_id, name, os, arch, trust_level, last_seen_at, public_key) VALUES ({}, 'local', {}, {}, {}, {}, 'personal', {}, {});\n",
+            sql_string(&id),
+            sql_string(&user),
+            sql_string(name),
+            sql_string(current_os()),
+            sql_string(current_arch()),
+            now,
+            sql_string(&public_key)
+        ),
+    )?;
+    log_operation(
+        &root,
+        "device_enroll",
+        ".",
+        &format!("{{\"device\":{}}}", json_string(&id)),
+        "done",
+    )?;
+    println!("device enrolled: {id} {name}");
+    Ok(())
+}
+
+fn cmd_device_list() -> Result<(), String> {
+    let root = env::current_dir()
+        .map_err(|err| format!("current dir: {err}"))
+        .ok()
+        .and_then(|dir| find_workspace_root(&dir))
+        .ok_or_else(|| "no .devdrop workspace found; run inside a workspace".to_string())?;
+    init_db(&root)?;
+    let rows = query_lines(
+        &db_path(&root),
+        "SELECT id||char(9)||user_id||char(9)||name||char(9)||os||char(9)||arch||char(9)||trust_level||char(9)||last_seen_at FROM devices ORDER BY last_seen_at DESC, name;",
+    )?;
+    if rows.is_empty() {
+        println!("no devices enrolled");
+        return Ok(());
+    }
+
+    for row in rows {
+        let fields = row.split('\t').collect::<Vec<_>>();
+        if fields.len() == 7 {
+            println!(
+                "{} user={} name={} os={} arch={} trust={} last_seen={}",
+                fields[0], fields[1], fields[2], fields[3], fields[4], fields[5], fields[6]
+            );
+        }
+    }
+    Ok(())
 }
 
 fn cmd_repo(args: &[String]) -> Result<(), String> {
@@ -798,6 +905,8 @@ fn cmd_doctor(root: PathBuf) -> Result<(), String> {
     let objects = object_store_path(&root);
     let secrets = secret_store_path(&root);
     let remote = read_remote_config(&root).ok().flatten();
+    let user = current_user(&root).ok().flatten();
+    let devices = device_count(&root).unwrap_or(0);
 
     println!("workspace: ok {}", display_path(&root));
     println!(
@@ -824,6 +933,13 @@ fn cmd_doctor(root: PathBuf) -> Result<(), String> {
         "metadata db: {}",
         if db.exists() { "ok" } else { "missing" }
     );
+    println!(
+        "auth: {}",
+        user.as_deref()
+            .map(|user| format!("ok user={user}"))
+            .unwrap_or_else(|| "not logged in".to_string())
+    );
+    println!("devices: {devices}");
     println!(
         "object store: {}",
         if objects.is_dir() { "ok" } else { "missing" }
@@ -1024,6 +1140,60 @@ fn read_remote_config(root: &Path) -> Result<Option<PathBuf>, String> {
     let text = fs::read_to_string(&path).map_err(|err| format!("read remote config: {err}"))?;
     let text = text.trim();
     Ok((!text.is_empty()).then(|| PathBuf::from(text)))
+}
+
+fn upsert_user(root: &Path, user: &str) -> Result<(), String> {
+    run_sql(
+        &db_path(root),
+        &format!(
+            "INSERT OR REPLACE INTO users (id, workspace_id, name, logged_in_at) VALUES ({}, 'local', {}, {});\n",
+            sql_string(user),
+            sql_string(user),
+            now_secs()
+        ),
+    )
+}
+
+fn current_user(root: &Path) -> Result<Option<String>, String> {
+    let db = db_path(root);
+    if !db.exists() {
+        return Ok(None);
+    }
+    query_one(
+        &db,
+        "SELECT id FROM users WHERE workspace_id='local' ORDER BY logged_in_at DESC LIMIT 1;",
+    )
+}
+
+fn device_count(root: &Path) -> Result<usize, String> {
+    let db = db_path(root);
+    if !db.exists() {
+        return Ok(0);
+    }
+    let count = query_one(
+        &db,
+        "SELECT count(*) FROM devices WHERE workspace_id='local';",
+    )?
+    .unwrap_or_else(|| "0".to_string());
+    count
+        .parse()
+        .map_err(|err| format!("parse device count: {err}"))
+}
+
+fn current_os() -> &'static str {
+    match env::consts::OS {
+        "macos" => "macos",
+        "windows" => "windows",
+        _ => "linux",
+    }
+}
+
+fn current_arch() -> &'static str {
+    match env::consts::ARCH {
+        "x86_64" | "x86" => "x64",
+        "aarch64" => "arm64",
+        _ => env::consts::ARCH,
+    }
 }
 
 struct AgentRow {
@@ -1278,6 +1448,23 @@ CREATE TABLE IF NOT EXISTS tombstones (
   content_hash TEXT,
   deleted_at INTEGER NOT NULL,
   UNIQUE(workspace_id, path, deleted_at)
+);
+CREATE TABLE IF NOT EXISTS users (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  logged_in_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS devices (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  os TEXT NOT NULL,
+  arch TEXT NOT NULL,
+  trust_level TEXT NOT NULL,
+  last_seen_at INTEGER NOT NULL,
+  public_key TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sync_rules (
   id TEXT PRIMARY KEY,
