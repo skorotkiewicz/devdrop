@@ -37,11 +37,11 @@ fn run() -> Result<(), String> {
         Some("run") => cmd_run(&args[1..]),
         Some("daemon") => cmd_daemon(&args[1..]),
         Some("sync") => cmd_sync(&args[1..]),
-        Some("status") => cmd_status(optional_path(args.get(1))?),
+        Some("status") => cmd_status(&args[1..]),
         Some("ls") => cmd_ls(optional_path(args.get(1))?),
         Some("ignored") => cmd_ignored(optional_path(args.get(1))?),
         Some("conflicts") => cmd_conflicts(&args[1..]),
-        Some("repo-status") => cmd_repo_status(optional_path(args.get(1))?),
+        Some("repo-status") => cmd_repo_status(&args[1..]),
         Some("doctor") => cmd_doctor(optional_path(args.get(1))?),
         Some("hydrate") => cmd_hydrate(required_path(args.get(1), "hydrate")?),
         Some("history") => cmd_history(required_path(args.get(1), "history")?),
@@ -65,6 +65,7 @@ Usage:
   devdrop repo update [path]
   devdrop remote init <path>
   devdrop secret add <path> --scope <scope>
+  devdrop secret request <path> [--scope <scope>]
   devdrop secret unlock <path> [--scope <scope>]
   devdrop secret lock <path> [--scope <scope>]
   devdrop agent create --repo <path> [--write-scope <scope>] [--secret-scope <scope>]
@@ -75,12 +76,12 @@ Usage:
   devdrop run --repo <path> --secret-scope <scope> -- <command>
   devdrop daemon [path] [--remote <path>] [--interval <seconds>] [--once]
   devdrop sync [path] [--remote <path>] [--pull]
-  devdrop status [path]
+  devdrop status [path] [--json]
   devdrop ls [path]
   devdrop ignored [path]
   devdrop conflicts [path]
   devdrop conflicts resolve <path> --use base|conflict
-  devdrop repo-status [path]
+  devdrop repo-status [path] [--json]
   devdrop hydrate <path>
   devdrop history <path>
   devdrop recover <path> [--hash <content-hash>]
@@ -241,6 +242,11 @@ fn cmd_secret(args: &[String]) -> Result<(), String> {
             let scope = flag_value(args, "--scope").unwrap_or("dev");
             cmd_secret_add(&path, scope)
         }
+        Some("request") => {
+            let path = required_path(args.get(1), "secret request")?;
+            let scope = flag_value(args, "--scope").unwrap_or("dev");
+            cmd_secret_request(&path, scope)
+        }
         Some("unlock") => {
             let path = required_path(args.get(1), "secret unlock")?;
             let scope = flag_value(args, "--scope").unwrap_or("dev");
@@ -251,7 +257,7 @@ fn cmd_secret(args: &[String]) -> Result<(), String> {
             let scope = flag_value(args, "--scope").unwrap_or("dev");
             cmd_secret_lock(&path, scope)
         }
-        _ => Err("usage: devdrop secret add|unlock|lock <path> [--scope <scope>]".into()),
+        _ => Err("usage: devdrop secret add|request|unlock|lock <path> [--scope <scope>]".into()),
     }
 }
 
@@ -513,6 +519,25 @@ fn cmd_secret_unlock(path: &Path, scope: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_secret_request(path: &Path, scope: &str) -> Result<(), String> {
+    require_secret_key()?;
+    let root = find_workspace_root(path).ok_or_else(|| {
+        "no .devdrop workspace found; run `devdrop workspace init <path>`".to_string()
+    })?;
+    let rel = pin_path(&root, path);
+    let secret = lookup_secret(&root, &rel, scope)?;
+    let plaintext = openssl_decrypt_to_string(&secret.encrypted_path)?;
+    print!("{plaintext}");
+    log_operation(
+        &root,
+        "secret_request",
+        &rel,
+        &format!("{{\"scope\":{}}}", json_string(scope)),
+        "done",
+    )?;
+    Ok(())
+}
+
 fn cmd_secret_lock(path: &Path, scope: &str) -> Result<(), String> {
     let root = find_workspace_root(path).ok_or_else(|| {
         "no .devdrop workspace found; run `devdrop workspace init <path>`".to_string()
@@ -594,7 +619,9 @@ fn snapshot_signature(snapshot: &IndexSnapshot) -> u64 {
     hash
 }
 
-fn cmd_status(root: PathBuf) -> Result<(), String> {
+fn cmd_status(args: &[String]) -> Result<(), String> {
+    let root = optional_path(first_positional(args))?;
+    let json = args.iter().any(|arg| arg == "--json");
     require_dir(&root)?;
 
     let rules = Rules::load(&root)?;
@@ -607,6 +634,26 @@ fn cmd_status(root: PathBuf) -> Result<(), String> {
     } else {
         "missing"
     };
+
+    if json {
+        println!(
+            "{{\"workspace\":{},\"index\":{},\"entries\":{},\"local\":{},\"ignored\":{},\"metadata_only\":{},\"local_only\":{},\"remote_only\":{},\"secret_locked\":{},\"conflicted\":{},\"repos\":{},\"dirty_repos\":{},\"pins\":{}}}",
+            json_string(&display_path(&root)),
+            json_string(index),
+            counts.entries,
+            counts.local,
+            counts.ignored,
+            counts.metadata_only,
+            counts.local_only,
+            counts.remote_only,
+            counts.secret_locked,
+            counts.conflicted,
+            counts.repos,
+            counts.dirty_repos,
+            pins.len()
+        );
+        return Ok(());
+    }
 
     println!("workspace: {}", display_path(&root));
     println!("index: {index}");
@@ -861,10 +908,25 @@ fn archive_conflict_file(root: &Path, path: &Path) -> Result<PathBuf, String> {
     Ok(archive)
 }
 
-fn cmd_repo_status(root: PathBuf) -> Result<(), String> {
+fn cmd_repo_status(args: &[String]) -> Result<(), String> {
+    let root = optional_path(first_positional(args))?;
+    let json = args.iter().any(|arg| arg == "--json");
     require_dir(&root)?;
     let rules = Rules::load(&root)?;
     let repos = find_repos(&root, &rules)?;
+
+    if json {
+        print!("[");
+        for (index, repo) in repos.iter().enumerate() {
+            let status = repo_status(repo);
+            if index > 0 {
+                print!(",");
+            }
+            print_repo_status_json(repo, &status);
+        }
+        println!("]");
+        return Ok(());
+    }
 
     if repos.is_empty() {
         println!("no git repos found");
@@ -1571,8 +1633,7 @@ fn first_positional(args: &[String]) -> Option<&String> {
         }
         match arg.as_str() {
             "--interval" | "--remote" | "--repo" | "--scope" | "--secret-scope" => skip_next = true,
-            "--pull" => {}
-            "--once" => {}
+            "--json" | "--once" | "--pull" => {}
             _ if arg.starts_with("--") => {}
             _ => return Some(arg),
         }
@@ -2023,6 +2084,10 @@ fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 
 fn json_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn json_optional(value: Option<&str>) -> String {
+    value.map(json_string).unwrap_or_else(|| "null".to_string())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2898,6 +2963,20 @@ fn stale_repo_warning(path: &Path, status: &RepoStatus) -> Option<String> {
             display_path(path)
         )
     })
+}
+
+fn print_repo_status_json(path: &Path, status: &RepoStatus) {
+    print!(
+        "{{\"path\":{},\"remote\":{},\"branch\":{},\"head\":{},\"upstream\":{},\"ahead\":{},\"behind\":{},\"dirty\":{}}}",
+        json_string(&display_path(path)),
+        json_optional(status.remote_url.as_deref()),
+        json_optional(status.branch.as_deref()),
+        json_optional(status.head.as_deref()),
+        json_optional(status.upstream.as_deref()),
+        status.ahead.unwrap_or(0),
+        status.behind.unwrap_or(0),
+        status.dirty
+    );
 }
 
 fn run_git(path: &Path, args: &[&str]) -> Result<(), String> {
