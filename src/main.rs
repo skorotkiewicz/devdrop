@@ -42,6 +42,8 @@ fn run() -> Result<(), String> {
         Some("repo-status") => cmd_repo_status(optional_path(args.get(1))?),
         Some("doctor") => cmd_doctor(optional_path(args.get(1))?),
         Some("hydrate") => cmd_hydrate(required_path(args.get(1), "hydrate")?),
+        Some("history") => cmd_history(required_path(args.get(1), "history")?),
+        Some("recover") => cmd_recover(&args[1..]),
         Some("pin") => cmd_pin(required_path(args.get(1), "pin")?, true),
         Some("unpin") => cmd_pin(required_path(args.get(1), "unpin")?, false),
         Some(other) => Err(format!("unknown command `{other}`; run `devdrop help`")),
@@ -75,6 +77,8 @@ Usage:
   devdrop conflicts resolve <path> --use base|conflict
   devdrop repo-status [path]
   devdrop hydrate <path>
+  devdrop history <path>
+  devdrop recover <path> [--hash <content-hash>]
   devdrop pin <path>
   devdrop unpin <path>
   devdrop doctor [path]"
@@ -853,6 +857,63 @@ fn cmd_hydrate(path: PathBuf) -> Result<(), String> {
     }
 }
 
+fn cmd_history(path: PathBuf) -> Result<(), String> {
+    let root = find_workspace_root(&path)
+        .or_else(|| path.parent().and_then(find_workspace_root))
+        .ok_or_else(|| {
+            "no .devdrop workspace found; run `devdrop workspace init <path>`".to_string()
+        })?;
+    let rel = pin_path(&root, &path);
+    let rows = file_versions(&root, &rel)?;
+    if rows.is_empty() {
+        println!("no history for {rel}");
+        return Ok(());
+    }
+
+    for row in rows {
+        println!(
+            "{} size={} seen_at={} present={}",
+            row.content_hash,
+            row.size,
+            row.seen_at,
+            object_path(&root, &row.content_hash).exists()
+        );
+    }
+    Ok(())
+}
+
+fn cmd_recover(args: &[String]) -> Result<(), String> {
+    let path = required_path(args.first(), "recover")?;
+    let root = find_workspace_root(&path)
+        .or_else(|| path.parent().and_then(find_workspace_root))
+        .ok_or_else(|| {
+            "no .devdrop workspace found; run `devdrop workspace init <path>`".to_string()
+        })?;
+    let rel = pin_path(&root, &path);
+    let hash = flag_value(args, "--hash")
+        .map(str::to_string)
+        .or_else(|| latest_file_version_hash(&root, &rel).ok().flatten())
+        .ok_or_else(|| format!("no history for {rel}"))?;
+    let object = object_path(&root, &hash);
+    if !object.exists() {
+        fetch_remote_object(&root, &hash)?;
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("create {}: {err}", display_path(parent)))?;
+    }
+    fs::copy(&object, &path).map_err(|err| format!("recover {}: {err}", display_path(&path)))?;
+    log_operation(
+        &root,
+        "recover",
+        &rel,
+        &format!("{{\"hash\":{}}}", json_string(&hash)),
+        "done",
+    )?;
+    println!("recovered: {rel} {hash}");
+    Ok(())
+}
+
 fn cmd_pin(path: PathBuf, pin: bool) -> Result<(), String> {
     let root = find_workspace_root(&path).ok_or_else(|| {
         "no .devdrop workspace found; run `devdrop workspace init <path>`".to_string()
@@ -1199,6 +1260,24 @@ CREATE TABLE IF NOT EXISTS blobs (
   local_path TEXT,
   present INTEGER NOT NULL DEFAULT 0,
   ref_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS file_versions (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL,
+  path TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  local_path TEXT NOT NULL,
+  seen_at INTEGER NOT NULL,
+  UNIQUE(workspace_id, path, content_hash)
+);
+CREATE TABLE IF NOT EXISTS tombstones (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL,
+  path TEXT NOT NULL,
+  content_hash TEXT,
+  deleted_at INTEGER NOT NULL,
+  UNIQUE(workspace_id, path, deleted_at)
 );
 CREATE TABLE IF NOT EXISTS sync_rules (
   id TEXT PRIMARY KEY,
@@ -2009,6 +2088,17 @@ struct BlobRow {
     ref_count: usize,
 }
 
+struct PreviousFile {
+    path: String,
+    content_hash: String,
+}
+
+struct FileVersion {
+    content_hash: String,
+    size: u64,
+    seen_at: i64,
+}
+
 fn scan_workspace(root: &Path, rules: &Rules) -> Result<Counts, String> {
     let mut counts = Counts::default();
 
@@ -2140,6 +2230,85 @@ fn push_index_node(
     Ok(())
 }
 
+fn previous_index_files(root: &Path) -> Result<Vec<PreviousFile>, String> {
+    let db = db_path(root);
+    if !db.exists() {
+        return Ok(Vec::new());
+    }
+
+    query_lines(
+        &db,
+        "SELECT hex(path)||char(9)||hex(content_hash) FROM nodes WHERE workspace_id='local' AND content_hash IS NOT NULL;",
+    )?
+    .into_iter()
+    .map(|line| {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != 2 {
+            return Err("bad previous file row".to_string());
+        }
+        Ok(PreviousFile {
+            path: hex_decode_string(fields[0])?,
+            content_hash: hex_decode_string(fields[1])?,
+        })
+    })
+    .collect()
+}
+
+fn file_version_sql(path: &str, hash: &str, size: u64, local_path: &Path, seen_at: i64) -> String {
+    format!(
+        "INSERT OR REPLACE INTO file_versions (id, workspace_id, path, content_hash, size, local_path, seen_at) VALUES ({}, 'local', {}, {}, {}, {}, {});\n",
+        sql_string(&format!(
+            "version_{:016x}_{:016x}",
+            fnv_bytes(path.as_bytes()),
+            fnv_bytes(hash.as_bytes())
+        )),
+        sql_string(path),
+        sql_string(hash),
+        size,
+        sql_string(&local_path.to_string_lossy()),
+        seen_at
+    )
+}
+
+fn file_versions(root: &Path, rel: &str) -> Result<Vec<FileVersion>, String> {
+    init_db(root)?;
+    query_lines(
+        &db_path(root),
+        &format!(
+            "SELECT hex(content_hash)||char(9)||size||char(9)||seen_at FROM file_versions WHERE workspace_id='local' AND path={} ORDER BY seen_at DESC;",
+            sql_string(rel)
+        ),
+    )?
+    .into_iter()
+    .map(|line| {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != 3 {
+            return Err("bad file version row".to_string());
+        }
+        Ok(FileVersion {
+            content_hash: hex_decode_string(fields[0])?,
+            size: fields[1]
+                .parse()
+                .map_err(|err| format!("bad version size: {err}"))?,
+            seen_at: fields[2]
+                .parse()
+                .map_err(|err| format!("bad version timestamp: {err}"))?,
+        })
+    })
+    .collect()
+}
+
+fn latest_file_version_hash(root: &Path, rel: &str) -> Result<Option<String>, String> {
+    init_db(root)?;
+    query_one(
+        &db_path(root),
+        &format!(
+            "SELECT content_hash FROM file_versions WHERE workspace_id='local' AND path={} ORDER BY seen_at DESC LIMIT 1;",
+            sql_string(rel)
+        ),
+    )
+}
+
 fn local_state_for(rel: &str, action: Action) -> &'static str {
     if is_conflict_path(rel) {
         "conflicted"
@@ -2158,6 +2327,12 @@ fn write_index(root: &Path, rules: &Rules, snapshot: &IndexSnapshot) -> Result<(
     init_db(root)?;
     let db = db_path(root);
     let now = now_secs();
+    let previous = previous_index_files(root)?;
+    let current_paths = snapshot
+        .nodes
+        .iter()
+        .map(|node| node.path.as_str())
+        .collect::<HashSet<_>>();
     let mut sql = String::from(
         "
 BEGIN;
@@ -2200,6 +2375,34 @@ DELETE FROM repo_status;
             blob.size,
             sql_string(&blob.local_path),
             blob.ref_count
+        ));
+    }
+
+    for node in snapshot
+        .nodes
+        .iter()
+        .filter(|node| node.content_hash.is_some())
+    {
+        let hash = node.content_hash.as_deref().unwrap_or_default();
+        sql.push_str(&file_version_sql(
+            &node.path,
+            hash,
+            node.size,
+            &object_path(root, hash),
+            now,
+        ));
+    }
+
+    for file in previous
+        .iter()
+        .filter(|file| !current_paths.contains(file.path.as_str()))
+    {
+        sql.push_str(&format!(
+            "INSERT OR IGNORE INTO tombstones (id, workspace_id, path, content_hash, deleted_at) VALUES ({}, 'local', {}, {}, {});\n",
+            sql_string(&format!("tombstone_{:016x}_{}", fnv_bytes(file.path.as_bytes()), now)),
+            sql_string(&file.path),
+            sql_optional(Some(file.content_hash.as_str())),
+            now
         ));
     }
 
@@ -2368,6 +2571,13 @@ DELETE FROM repo_status;
                 node.size,
                 sql_string(&object_path(root, hash).to_string_lossy()),
                 i32::from(object_path(root, hash).exists())
+            ));
+            sql.push_str(&file_version_sql(
+                &node.path,
+                hash,
+                node.size,
+                &object_path(root, hash),
+                now,
             ));
         }
     }
