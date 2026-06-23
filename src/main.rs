@@ -34,6 +34,7 @@ fn run() -> Result<(), String> {
         Some("remote") => cmd_remote(&args[1..]),
         Some("secret") => cmd_secret(&args[1..]),
         Some("agent") => cmd_agent(&args[1..]),
+        Some("overlay") => cmd_overlay(&args[1..]),
         Some("run") => cmd_run(&args[1..]),
         Some("daemon") => cmd_daemon(&args[1..]),
         Some("sync") => cmd_sync(&args[1..]),
@@ -73,6 +74,8 @@ Usage:
   devdrop agent diff <agent-id>
   devdrop agent accept <agent-id>
   devdrop agent reject <agent-id>
+  devdrop overlay diff [agent-id]
+  devdrop overlay submit [agent-id]
   devdrop run --repo <path> --secret-scope <scope> -- <command>
   devdrop daemon [path] [--remote <path>] [--interval <seconds>] [--once]
   devdrop sync [path] [--remote <path>] [--pull]
@@ -279,6 +282,17 @@ fn cmd_agent(args: &[String]) -> Result<(), String> {
     }
 }
 
+fn cmd_overlay(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("diff") => {
+            let (_, agent) = find_overlay_agent(args.get(1).map(String::as_str))?;
+            cmd_agent_diff(&agent.id)
+        }
+        Some("submit") => cmd_overlay_submit(args.get(1).map(String::as_str)),
+        _ => Err("usage: devdrop overlay diff|submit [agent-id]".into()),
+    }
+}
+
 fn cmd_agent_create(repo: &Path, write_scope: &str, secret_scope: &str) -> Result<(), String> {
     require_dir(repo)?;
     let root = find_workspace_root(repo).ok_or_else(|| {
@@ -341,7 +355,7 @@ fn cmd_agent_status() -> Result<(), String> {
 
 fn cmd_agent_diff(id: &str) -> Result<(), String> {
     let (root, agent) = find_agent(id)?;
-    ensure_agent_pending(&agent)?;
+    ensure_agent_reviewable(&agent)?;
     let output = Command::new("diff")
         .args(["-ruN"])
         .arg(&agent.repo_path)
@@ -365,7 +379,7 @@ fn cmd_agent_diff(id: &str) -> Result<(), String> {
 
 fn cmd_agent_finish(id: &str, accept: bool) -> Result<(), String> {
     let (root, agent) = find_agent(id)?;
-    ensure_agent_pending(&agent)?;
+    ensure_agent_reviewable(&agent)?;
     if accept {
         sync_tree(Path::new(&agent.overlay_path), Path::new(&agent.repo_path))?;
     }
@@ -383,6 +397,23 @@ fn cmd_agent_finish(id: &str, accept: bool) -> Result<(), String> {
         "done",
     )?;
     println!("agent {status}: {id}");
+    Ok(())
+}
+
+fn cmd_overlay_submit(id: Option<&str>) -> Result<(), String> {
+    let (root, agent) = find_overlay_agent(id)?;
+    if agent.status != "pending" && agent.status != "submitted" {
+        return Err(format!("agent {} is {}", agent.id, agent.status));
+    }
+    update_agent_status(&root, &agent.id, "submitted")?;
+    log_operation(
+        &root,
+        "overlay_submit",
+        &agent.repo_path,
+        &format!("{{\"agent\":{}}}", json_string(&agent.id)),
+        "done",
+    )?;
+    println!("overlay submitted: {}", agent.id);
     Ok(())
 }
 
@@ -1258,6 +1289,7 @@ fn current_arch() -> &'static str {
     }
 }
 
+#[derive(Clone)]
 struct AgentRow {
     id: String,
     repo_path: String,
@@ -1346,8 +1378,36 @@ fn find_agent(id: &str) -> Result<(PathBuf, AgentRow), String> {
     Ok((root, agent))
 }
 
-fn ensure_agent_pending(agent: &AgentRow) -> Result<(), String> {
-    if agent.status == "pending" {
+fn find_overlay_agent(id: Option<&str>) -> Result<(PathBuf, AgentRow), String> {
+    if let Some(id) = id {
+        return find_agent(id);
+    }
+
+    let cwd = env::current_dir().map_err(|err| format!("current dir: {err}"))?;
+    let root =
+        find_workspace_root(&cwd).ok_or_else(|| "no .devdrop workspace found".to_string())?;
+    let agents = list_agents(&root)?;
+    let cwd = fs::canonicalize(&cwd).unwrap_or(cwd);
+
+    if let Some(agent) = agents.iter().find(|agent| {
+        fs::canonicalize(&agent.overlay_path).is_ok_and(|overlay| cwd.starts_with(overlay))
+    }) {
+        return Ok((root, agent.clone()));
+    }
+
+    let pending = agents
+        .into_iter()
+        .filter(|agent| agent.status == "pending" || agent.status == "submitted")
+        .collect::<Vec<_>>();
+    match pending.as_slice() {
+        [agent] => Ok((root, agent.clone())),
+        [] => Err("no pending agent overlay; pass <agent-id>".into()),
+        _ => Err("multiple pending agent overlays; pass <agent-id>".into()),
+    }
+}
+
+fn ensure_agent_reviewable(agent: &AgentRow) -> Result<(), String> {
+    if agent.status == "pending" || agent.status == "submitted" {
         Ok(())
     } else {
         Err(format!("agent {} is {}", agent.id, agent.status))
