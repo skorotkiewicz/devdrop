@@ -279,13 +279,14 @@
         <p class="eyebrow">Local-first workspace helper</p>
       </div>
       <h1>Start using devdrop.</h1>
-      <p class="lead">devdrop keeps a developer workspace legible across machines and agents: the tree, sync state, ignored generated files, encrypted secrets, repo status, and reviewable agent overlays.</p>
+      <p class="lead">devdrop keeps a developer workspace synced from one config file: SSH remotes, bidirectional sync, conflict files, encrypted key-value secrets, and one-command overlay review.</p>
       <nav aria-label="Page navigation">
         <a href="#quickstart">Quickstart</a>
+        <a href="#config">Config</a>
         <a href="#daily-use">Daily use</a>
         <a href="#sync">Sync</a>
         <a href="#secrets">Secrets</a>
-        <a href="#agents">Agents</a>
+        <a href="#agents">Edit</a>
         <a href="#health">Health</a>
       </nav>
     </header>
@@ -294,33 +295,51 @@
       <section id="quickstart" class="two">
         <div>
           <h2>Quickstart</h2>
-          <p>Build the binary, create a workspace, enroll the current machine, then scan the workspace into the local SQLite index.</p>
-          <pre class="shell"><code>cargo build --release
-./target/release/devdrop workspace init ~/code
-cd ~/code
-devdrop login
-devdrop device enroll "MacBook Pro"
+          <p>Create a workspace once, set the remote once, then use short commands every day.</p>
+          <pre class="shell"><code>devdrop init ~/projects --remote ssh://server/backups/devdrop
+cd ~/projects
 devdrop sync
-devdrop status</code></pre>
+devdrop edit
+devdrop secret set API_KEY=xxx</code></pre>
         </div>
-        <pre class="tree"><code>~/code
-  work/
-    api/
-    web/
-  personal/
-    blog/
-  experiments/
-    prototype/</code></pre>
+        <pre class="tree"><code>~/projects
+  .devdrop.toml
+  api/
+  web/
+  tools/
+
+.devdrop.toml:
+  [remote]
+  url = "ssh://server/backups/devdrop"
+  auto_sync = true</code></pre>
       </section>
 
       <section>
         <h2>The model</h2>
         <div class="flow">
-          <div class="step"><b>1. Workspace</b>Choose one root, usually <code>~/code</code>. devdrop stores metadata in <code>.devdrop/</code>.</div>
-          <div class="step"><b>2. Scan</b><code>devdrop sync</code> records files, repo status, blobs, tombstones, and ignore rules.</div>
-          <div class="step"><b>3. Hydrate</b>Remote-only content can be fetched later with <code>devdrop hydrate</code>.</div>
-          <div class="step"><b>4. Review</b>Agent work lands in overlays before it touches the real repo.</div>
+          <div class="step"><b>1. Config</b><code>.devdrop.toml</code> stores the remote, pins, and secret scope defaults.</div>
+          <div class="step"><b>2. Sync</b><code>devdrop sync</code> pulls, indexes local changes, pushes, hydrates files, and writes conflicts.</div>
+          <div class="step"><b>3. Remote</b>Use a local path, <code>file://</code> URL, or <code>ssh://host/path</code> backend.</div>
+          <div class="step"><b>4. Review</b><code>devdrop edit</code> opens an overlay in <code>$EDITOR</code>, shows a diff, then accepts or rejects.</div>
         </div>
+      </section>
+
+      <section id="config">
+        <h2>Config File</h2>
+        <p>The remote no longer has to be passed to every command. Add it during init, with <code>remote add</code>, or by editing <code>.devdrop.toml</code>.</p>
+        <pre class="shell"><code>devdrop init ~/projects --remote ssh://server/backups/devdrop
+devdrop remote add ssh://server/backups/devdrop
+devdrop config set pins api/src,web/src
+devdrop config set secrets.default.scope dev</code></pre>
+        <pre class="tree"><code>[remote]
+url = "ssh://server/backups/devdrop"
+auto_sync = true
+
+pins = ["api/src", "web/src"]
+
+[secrets.default]
+scope = "dev"
+env_vars = ["API_KEY"]</code></pre>
       </section>
 
       <section id="daily-use">
@@ -328,19 +347,21 @@ devdrop status</code></pre>
         <div class="grid">
           <div class="card">
             <strong>See the workspace</strong>
-            <p><code>devdrop status</code> shows local, ignored, remote-only, locked secret, conflict, and repo counts.</p>
+            <p><code>devdrop status</code> shows local, ignored, remote-only, locked secret, conflict, repo, and remote state.</p>
           </div>
           <div class="card">
             <strong>List with state</strong>
-            <p><code>devdrop ls ~/code/work</code> prints entries as local, ignored, metadata-only, remote-only, or secret-locked.</p>
+            <p><code>devdrop ls ~/projects/api</code> prints entries as local, ignored, metadata-only, remote-only, or secret-locked.</p>
           </div>
           <div class="card">
             <strong>Keep important files</strong>
-            <p><code>devdrop pin path</code> marks a path as important. Use <code>unpin</code> when it no longer needs priority.</p>
+            <p><code>devdrop pin path</code> writes a local pin, and <code>devdrop config set pins ...</code> stores shared pins.</p>
           </div>
         </div>
         <h3>Useful commands</h3>
         <div class="command-list">
+          <div class="command"><code>devdrop sync</code><span>Run bidirectional sync using the configured remote.</span></div>
+          <div class="command"><code>devdrop remote add ssh://host/path</code><span>Set or replace the remote in <code>.devdrop.toml</code>.</span></div>
           <div class="command"><code>devdrop ignored [path]</code><span>Show files excluded by built-in rules or <code>.devsyncignore</code>.</span></div>
           <div class="command"><code>devdrop repo-status [path]</code><span>List Git branches, dirty state, ahead/behind counts, and stale-base warnings.</span></div>
           <div class="command"><code>devdrop repo update [path]</code><span>Run a safe <code>git fetch --prune</code> and fast-forward merge for the repo upstream.</span></div>
@@ -351,37 +372,45 @@ devdrop status</code></pre>
 
       <section id="sync">
         <h2>Sync between machines</h2>
-        <p>The current product uses a file-backed remote. Put it on a shared disk, network mount, or synced folder while the cloud service is still out of scope.</p>
-        <pre class="shell"><code><span class="comment"># On the shared location</span>
-devdrop remote init /mnt/devdrop-remote
+        <p><code>devdrop sync</code> now pulls remote changes, scans local files, pushes updates, and handles conflicts in one command.</p>
+        <pre class="shell"><code><span class="comment"># Machine A</span>
+devdrop init ~/projects --remote ssh://server/backups/devdrop
+cd ~/projects
+devdrop sync
 
-<span class="comment"># On machine A</span>
-devdrop sync ~/code --remote /mnt/devdrop-remote
+<span class="comment"># Machine B</span>
+devdrop init ~/projects --remote ssh://server/backups/devdrop
+cd ~/projects
+devdrop sync
 
-<span class="comment"># On machine B</span>
-devdrop workspace mount ~/code
-devdrop sync ~/code --remote /mnt/devdrop-remote --pull
-devdrop ls ~/code</code></pre>
-        <p class="note">Generated folders such as <code>node_modules</code>, <code>target</code>, <code>.venv</code>, caches, logs, and secret files are classified by default so they do not sync as ordinary source.</p>
+<span class="comment"># Local remotes still work</span>
+devdrop remote add /mnt/devdrop-remote
+devdrop sync</code></pre>
+        <p class="note">If both machines edit the same file before syncing, devdrop keeps the local file and writes the remote version as <code>name.conflict-remote-&lt;id&gt;.ext</code>.</p>
       </section>
 
       <section id="secrets">
         <h2>Secrets</h2>
-        <p>Secrets are encrypted locally with OpenSSL and tracked as locked metadata until explicitly unlocked or requested for a process.</p>
-        <pre class="shell"><code>export DEVDROP_SECRET_KEY="choose-a-local-passphrase"
-devdrop secret add ~/code/work/api/.env --scope dev
-devdrop secret lock ~/code/work/api/.env --scope dev
-devdrop secret request ~/code/work/api/.env --scope dev
-devdrop run --repo ~/code/work/api --secret-scope dev -- cargo test</code></pre>
+        <p>Use key-value secrets for the common case. devdrop creates a local workspace key when <code>DEVDROP_SECRET_KEY</code> is not set.</p>
+        <pre class="shell"><code>devdrop secret set API_KEY=xxx
+devdrop secret list
+devdrop run --repo ~/projects/api -- printenv API_KEY
+
+<span class="comment"># File-based secrets still work</span>
+devdrop secret add ~/projects/api/.env --scope dev
+devdrop secret lock ~/projects/api/.env --scope dev
+devdrop secret unlock ~/projects/api/.env --scope dev</code></pre>
       </section>
 
       <section id="agents">
-        <h2>Agent overlays</h2>
-        <p>Agents work in an overlay copy. Review the diff, submit it, then accept or reject it. Accepting enforces the stored write scope.</p>
-        <pre class="shell"><code>devdrop agent create --repo ~/code/work/api --write-scope 'src/**' --secret-scope test
-devdrop agent status
-devdrop overlay diff &lt;agent-id&gt;
-devdrop overlay submit &lt;agent-id&gt;
+        <h2>Edit And Review</h2>
+        <p><code>devdrop edit</code> wraps the overlay workflow: copy to an overlay, open <code>$EDITOR</code>, show a diff, then ask whether to accept the changes.</p>
+        <pre class="shell"><code>cd ~/projects/api
+devdrop edit
+
+<span class="comment"># Lower-level commands are still available</span>
+devdrop agent create --repo ~/projects/api --write-scope 'src/**'
+devdrop agent diff &lt;agent-id&gt;
 devdrop agent accept &lt;agent-id&gt;</code></pre>
         <p>For machine-readable agent calls, use <code>devdrop status --json</code>, <code>devdrop repo-status --json</code>, and <code>devdrop secret request</code>.</p>
       </section>
@@ -389,9 +418,9 @@ devdrop agent accept &lt;agent-id&gt;</code></pre>
       <section id="health">
         <h2>Health checks</h2>
         <p>Run doctor when setup feels wrong, a remote is missing, auth/device state is unclear, or a tool dependency is not installed.</p>
-        <pre class="shell"><code>devdrop doctor ~/code
-devdrop conflicts ~/code
-devdrop conflicts resolve ~/code/work/api/src/config.ts --use base</code></pre>
+        <pre class="shell"><code>devdrop doctor ~/projects
+devdrop conflicts ~/projects
+devdrop conflicts resolve ~/projects/api/src/config.conflict-remote-123.ts --use conflict</code></pre>
       </section>
     </main>
 
