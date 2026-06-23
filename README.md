@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/logo.svg" width="50" height="50" alt="devdrop logo">
+  <img src="https://raw.githubusercontent.com/skorotkiewicz/devdrop/refs/heads/docs/logo.svg" width="50" height="50" alt="devdrop logo">
 </p>
 
 <h1 align="center">devdrop</h1>
@@ -80,9 +80,3 @@ devdrop agent accept <agent-id>
 ```
 
 Agent accepts are scoped: changes outside `--write-scope` are blocked.
-
-## Docs
-
-Open [docs/index.html](docs/index.html) for the guided version.
-
-The architecture plan lives in [PLAN.md](PLAN.md).
