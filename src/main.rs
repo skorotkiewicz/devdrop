@@ -1280,6 +1280,10 @@ fn remote_secrets_path(remote: &Path) -> PathBuf {
     remote.join("secrets")
 }
 
+fn remote_devices_path(remote: &Path) -> PathBuf {
+    remote.join("devices.tsv")
+}
+
 fn write_remote_config(root: &Path, remote: &Path) -> Result<(), String> {
     fs::write(
         remote_config_path(root),
@@ -1335,6 +1339,65 @@ fn device_count(root: &Path) -> Result<usize, String> {
     count
         .parse()
         .map_err(|err| format!("parse device count: {err}"))
+}
+
+fn push_remote_devices(root: &Path, remote: &Path) -> Result<(), String> {
+    let mut out = File::create(remote_devices_path(remote))
+        .map_err(|err| format!("write remote devices manifest: {err}"))?;
+    writeln!(out, "devdrop-devices-v1").map_err(|err| format!("write devices manifest: {err}"))?;
+
+    let db = db_path(root);
+    if !db.exists() {
+        return Ok(());
+    }
+
+    for row in query_lines(
+        &db,
+        "SELECT hex(id)||char(9)||hex(user_id)||char(9)||hex(name)||char(9)||hex(os)||char(9)||hex(arch)||char(9)||hex(trust_level)||char(9)||last_seen_at||char(9)||hex(public_key) FROM devices ORDER BY id;",
+    )? {
+        writeln!(out, "{row}").map_err(|err| format!("write devices manifest: {err}"))?;
+    }
+
+    Ok(())
+}
+
+fn pull_remote_devices(root: &Path, remote: &Path) -> Result<(), String> {
+    let manifest = remote_devices_path(remote);
+    if !manifest.exists() {
+        return Ok(());
+    }
+
+    let text =
+        fs::read_to_string(&manifest).map_err(|err| format!("read devices manifest: {err}"))?;
+    let mut lines = text.lines();
+    if lines.next() != Some("devdrop-devices-v1") {
+        return Err("unsupported remote devices manifest".into());
+    }
+
+    init_db(root)?;
+    let mut sql = String::from("BEGIN;\n");
+    for (index, line) in lines.enumerate() {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != 8 {
+            return Err(format!("bad devices manifest line {}", index + 2));
+        }
+        let last_seen_at = fields[6]
+            .parse::<i64>()
+            .map_err(|err| format!("bad device timestamp on line {}: {err}", index + 2))?;
+        sql.push_str(&format!(
+            "INSERT OR REPLACE INTO devices (id, workspace_id, user_id, name, os, arch, trust_level, last_seen_at, public_key) VALUES ({}, 'local', {}, {}, {}, {}, {}, {}, {});\n",
+            sql_string(&hex_decode_string(fields[0])?),
+            sql_string(&hex_decode_string(fields[1])?),
+            sql_string(&hex_decode_string(fields[2])?),
+            sql_string(&hex_decode_string(fields[3])?),
+            sql_string(&hex_decode_string(fields[4])?),
+            sql_string(&hex_decode_string(fields[5])?),
+            last_seen_at,
+            sql_string(&hex_decode_string(fields[7])?)
+        ));
+    }
+    sql.push_str("COMMIT;\n");
+    run_sql(&db_path(root), &sql)
 }
 
 fn current_os() -> &'static str {
@@ -2961,6 +3024,7 @@ fn push_remote(root: &Path, remote: &Path, snapshot: &IndexSnapshot) -> Result<(
     }
 
     push_remote_secrets(root, remote)?;
+    push_remote_devices(root, remote)?;
     Ok(())
 }
 
@@ -2976,6 +3040,7 @@ fn pull_remote(root: &Path, remote: &Path) -> Result<(), String> {
     }
 
     pull_remote_secrets(root, remote)?;
+    pull_remote_devices(root, remote)?;
     write_pulled_index(root, &nodes)?;
     Ok(())
 }
