@@ -305,6 +305,7 @@ fn cmd_agent_create(repo: &Path, write_scope: &str, secret_scope: &str) -> Resul
         "no .devdrop workspace found; run `devdrop workspace init <path>`".to_string()
     })?;
     init_db(&root)?;
+    ensure_agent_repo_fresh(&root, repo)?;
     let id = format!("agent_{}", now_nanos());
     let overlay = agent_overlay_path(&root, &id);
     let base = agent_base_path(&root, &id);
@@ -329,6 +330,43 @@ fn cmd_agent_create(repo: &Path, write_scope: &str, secret_scope: &str) -> Resul
     println!("agent created: {id}");
     println!("overlay: {}", display_path(&overlay));
     Ok(())
+}
+
+fn ensure_agent_repo_fresh(root: &Path, repo: &Path) -> Result<(), String> {
+    if !is_repo(repo)
+        || git_output(
+            repo,
+            &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+        )
+        .is_none()
+    {
+        return Ok(());
+    }
+
+    run_git(repo, &["fetch", "--prune"])
+        .map_err(|err| format!("refresh repo before creating agent: {err}"))?;
+    let status = repo_status(repo);
+    let behind = status.behind.unwrap_or(0);
+    if behind == 0 {
+        return Ok(());
+    }
+
+    let upstream = status.upstream.as_deref().unwrap_or("upstream");
+    log_operation(
+        root,
+        "agent_create_stale",
+        &pin_path(root, repo),
+        &format!(
+            "{{\"upstream\":{},\"behind\":{behind}}}",
+            json_string(upstream)
+        ),
+        "blocked",
+    )?;
+    Err(format!(
+        "{} is {behind} commits behind {upstream}; run `devdrop repo update {}` before creating an agent",
+        display_path(repo),
+        display_path(repo)
+    ))
 }
 
 fn cmd_agent_status() -> Result<(), String> {
@@ -886,7 +924,9 @@ fn cmd_conflicts_resolve(path: &Path, choice: &str) -> Result<(), String> {
             archive_conflict_file(&root, &pair.conflict)?;
         }
         "conflict" | "theirs" => {
-            archive_conflict_file(&root, &pair.base)?;
+            if pair.base.exists() {
+                archive_conflict_file(&root, &pair.base)?;
+            }
             if let Some(parent) = pair.base.parent() {
                 fs::create_dir_all(parent)
                     .map_err(|err| format!("create {}: {err}", display_path(parent)))?;

@@ -121,7 +121,13 @@ test "$(cat "$CONFLICT_FILE")" = "remote edit"
 $DEVDROP conflicts "$TEST_WS2" | grep -q "README"
 echo "PASS: Pull conflict keeps both versions"
 
-echo "=== Test 11e: Remote delete conflict keeps local edit ===" >&2
+echo "=== Test 11e: Pull conflict resolves to remote copy ===" >&2
+$DEVDROP conflicts resolve "$CONFLICT_FILE" --use conflict
+test "$(cat "$TEST_WS2/project/README.md")" = "remote edit"
+echo "PASS: Pull conflict resolves"
+
+echo "=== Test 11f: Remote delete conflict keeps local edit ===" >&2
+echo "local delete-conflict edit" > "$TEST_WS2/project/README.md"
 rm "$TEST_WS/project/README.md"
 cd "$TEST_WS"
 $DEVDROP sync "$TEST_WS" --remote "$TEST_REMOTE"
@@ -130,9 +136,14 @@ $DEVDROP sync "$TEST_WS2" --remote "$TEST_REMOTE" --pull
 test ! -e "$TEST_WS2/project/README.md"
 DELETE_CONFLICT=$(find "$TEST_WS2/project" -name 'README (conflict from local *).md' -print -quit)
 test -n "$DELETE_CONFLICT"
-test "$(cat "$DELETE_CONFLICT")" = "local edit"
+test "$(cat "$DELETE_CONFLICT")" = "local delete-conflict edit"
 $DEVDROP conflicts "$TEST_WS2" | grep -q "conflict from local"
 echo "PASS: Remote delete conflict keeps local edit"
+
+echo "=== Test 11g: Delete conflict resolves to local copy ===" >&2
+$DEVDROP conflicts resolve "$DELETE_CONFLICT" --use conflict
+test "$(cat "$TEST_WS2/project/README.md")" = "local delete-conflict edit"
+echo "PASS: Delete conflict resolves"
 
 echo "=== Test 12: Secrets (requires openssl) ===" >&2
 if command -v openssl &>/dev/null; then
@@ -149,22 +160,54 @@ else
     echo "SKIP: openssl not available"
 fi
 
-echo "=== Test 13: Agent workflow ===" >&2
+echo "=== Test 13: Stale repo blocks agent start ===" >&2
+TEST_UPSTREAM="$TEMP_DIR/upstream.git"
+TEST_SEED="$TEMP_DIR/upstream-seed"
+git init --bare "$TEST_UPSTREAM"
+git clone "$TEST_UPSTREAM" "$TEST_SEED"
+cd "$TEST_SEED"
+git config user.email "test@test.com"
+git config user.name "Test"
+git config commit.gpgsign false
+echo "one" > app.txt
+git add app.txt
+git commit -m "one"
+git branch -M main
+git push -u origin main
+git clone "$TEST_UPSTREAM" "$TEST_WS/stale-agent-repo"
+cd "$TEST_WS/stale-agent-repo"
+git config user.email "test@test.com"
+git config user.name "Test"
+git config commit.gpgsign false
+cd "$TEST_SEED"
+echo "two" >> app.txt
+git commit -am "two"
+git push
+cd "$TEST_WS"
+if $DEVDROP agent create --repo "$TEST_WS/stale-agent-repo" --write-scope "**" --secret-scope ""; then
+    echo "FAIL: stale repo should block agent start"
+    exit 1
+fi
+$DEVDROP repo update "$TEST_WS/stale-agent-repo"
+$DEVDROP agent create --repo "$TEST_WS/stale-agent-repo" --write-scope "**" --secret-scope "" >/dev/null
+echo "PASS: Stale repo blocks agent start"
+
+echo "=== Test 14: Agent workflow ===" >&2
 AGENT_ID=$($DEVDROP agent create --repo "$TEST_WS/project" --write-scope "src/**" --secret-scope "" | head -1 | awk '{print $3}')
 echo "PASS: Agent created: $AGENT_ID"
 
-echo "=== Test 13b: Agent diff (show changes) ===" >&2
+echo "=== Test 14b: Agent diff (show changes) ===" >&2
 # Modify a file in the overlay
 echo "fn main() { println!(); }" > "$TEST_WS/.devdrop/agents/$AGENT_ID/overlay/src/main.rs"
 cd "$TEST_WS"
 $DEVDROP agent diff "$AGENT_ID"
 echo "PASS: Agent diff shows changes"
 
-echo "=== Test 13c: Agent accept (apply overlay) ===" >&2
+echo "=== Test 14c: Agent accept (apply overlay) ===" >&2
 $DEVDROP agent accept "$AGENT_ID"
 echo "PASS: Agent changes accepted"
 
-echo "=== Test 13d: Stale agent accept is blocked ===" >&2
+echo "=== Test 14d: Stale agent accept is blocked ===" >&2
 STALE_AGENT_ID=$($DEVDROP agent create --repo "$TEST_WS/project" --write-scope "src/**" --secret-scope "" | head -1 | awk '{print $3}')
 echo "agent" > "$TEST_WS/.devdrop/agents/$STALE_AGENT_ID/overlay/src/stale.rs"
 echo "user" > "$TEST_WS/project/src/stale.rs"
@@ -176,11 +219,11 @@ if $DEVDROP agent accept "$STALE_AGENT_ID"; then
 fi
 test "$(cat "$TEST_WS/project/src/stale.rs")" = "user" && echo "PASS: Stale agent accept blocked" || echo "FAIL"
 
-echo "=== Test 14: Doctor check ===" >&2
+echo "=== Test 15: Doctor check ===" >&2
 $DEVDROP doctor "$TEST_WS"
 echo "PASS: doctor runs"
 
-echo "=== Test 15: History tracking ===" >&2
+echo "=== Test 16: History tracking ===" >&2
 echo "updated content" >> "$TEST_WS/project/README.md"
 cd "$TEST_WS"
 $DEVDROP sync "$TEST_WS" --remote "$TEST_REMOTE"
