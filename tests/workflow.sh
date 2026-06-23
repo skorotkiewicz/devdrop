@@ -109,6 +109,19 @@ test "$(cat "$CONFLICT_FILE")" = "remote edit"
 $DEVDROP conflicts "$TEST_WS2" | grep -q "README"
 echo "PASS: Pull conflict keeps both versions"
 
+echo "=== Test 11d: Remote delete conflict keeps local edit ===" >&2
+rm "$TEST_WS/project/README.md"
+cd "$TEST_WS"
+$DEVDROP sync "$TEST_WS" --remote "$TEST_REMOTE"
+cd "$TEST_WS2"
+$DEVDROP sync "$TEST_WS2" --remote "$TEST_REMOTE" --pull
+test ! -e "$TEST_WS2/project/README.md"
+DELETE_CONFLICT=$(find "$TEST_WS2/project" -name 'README (conflict from local *).md' -print -quit)
+test -n "$DELETE_CONFLICT"
+test "$(cat "$DELETE_CONFLICT")" = "local edit"
+$DEVDROP conflicts "$TEST_WS2" | grep -q "conflict from local"
+echo "PASS: Remote delete conflict keeps local edit"
+
 echo "=== Test 12: Secrets (requires openssl) ===" >&2
 if command -v openssl &>/dev/null; then
     export DEVDROP_SECRET_KEY="test-secret-key-12345"

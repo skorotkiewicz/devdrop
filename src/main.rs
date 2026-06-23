@@ -1284,6 +1284,10 @@ fn remote_devices_path(remote: &Path) -> PathBuf {
     remote.join("devices.tsv")
 }
 
+fn remote_tombstones_path(remote: &Path) -> PathBuf {
+    remote.join("tombstones.tsv")
+}
+
 fn write_remote_config(root: &Path, remote: &Path) -> Result<(), String> {
     fs::write(
         remote_config_path(root),
@@ -3025,12 +3029,14 @@ fn push_remote(root: &Path, remote: &Path, snapshot: &IndexSnapshot) -> Result<(
 
     push_remote_secrets(root, remote)?;
     push_remote_devices(root, remote)?;
+    push_remote_tombstones(root, remote)?;
     Ok(())
 }
 
 fn pull_remote(root: &Path, remote: &Path) -> Result<(), String> {
     init_workspace_storage(root)?;
     let nodes = read_remote_manifest(remote)?;
+    let tombstones = read_remote_tombstones(remote)?;
 
     for node in &nodes {
         if matches!(node.kind.as_str(), "directory" | "repo") && node.path != "." {
@@ -3042,6 +3048,7 @@ fn pull_remote(root: &Path, remote: &Path) -> Result<(), String> {
     pull_remote_secrets(root, remote)?;
     pull_remote_devices(root, remote)?;
     materialize_pull_conflicts(root, remote, &nodes)?;
+    apply_remote_tombstones(root, &tombstones)?;
     write_pulled_index(root, &nodes)?;
     Ok(())
 }
@@ -3108,6 +3115,106 @@ fn conflict_sibling_path(path: &Path, source: &str) -> Result<PathBuf, String> {
         .unwrap_or(name.len());
     let marker = format!(" (conflict from {source} {})", now_nanos());
     Ok(path.with_file_name(format!("{}{}{}", &name[..split], marker, &name[split..])))
+}
+
+struct RemoteTombstone {
+    path: String,
+    content_hash: Option<String>,
+    deleted_at: i64,
+}
+
+fn push_remote_tombstones(root: &Path, remote: &Path) -> Result<(), String> {
+    let mut out = File::create(remote_tombstones_path(remote))
+        .map_err(|err| format!("write remote tombstones: {err}"))?;
+    writeln!(out, "devdrop-tombstones-v1").map_err(|err| format!("write tombstones: {err}"))?;
+
+    let db = db_path(root);
+    if !db.exists() {
+        return Ok(());
+    }
+
+    for row in query_lines(
+        &db,
+        "SELECT hex(path)||char(9)||ifnull(hex(content_hash),'')||char(9)||deleted_at FROM tombstones ORDER BY deleted_at, path;",
+    )? {
+        writeln!(out, "{row}").map_err(|err| format!("write tombstones: {err}"))?;
+    }
+
+    Ok(())
+}
+
+fn read_remote_tombstones(remote: &Path) -> Result<Vec<RemoteTombstone>, String> {
+    let path = remote_tombstones_path(remote);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let text = fs::read_to_string(&path).map_err(|err| format!("read tombstones: {err}"))?;
+    let mut lines = text.lines();
+    if lines.next() != Some("devdrop-tombstones-v1") {
+        return Err("unsupported remote tombstones".into());
+    }
+
+    lines
+        .enumerate()
+        .map(|(index, line)| {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            if fields.len() != 3 {
+                return Err(format!("bad tombstone line {}", index + 2));
+            }
+            Ok(RemoteTombstone {
+                path: hex_decode_string(fields[0])?,
+                content_hash: (!fields[1].is_empty())
+                    .then(|| hex_decode_string(fields[1]))
+                    .transpose()?,
+                deleted_at: fields[2].parse().map_err(|err| {
+                    format!("bad tombstone timestamp on line {}: {err}", index + 2)
+                })?,
+            })
+        })
+        .collect()
+}
+
+fn apply_remote_tombstones(root: &Path, tombstones: &[RemoteTombstone]) -> Result<(), String> {
+    for tombstone in tombstones {
+        let path = root.join(&tombstone.path);
+        if !path.is_file() {
+            continue;
+        }
+
+        let (local_hash, _) = file_hash(&path)?;
+        if tombstone.content_hash.as_deref() == Some(local_hash.as_str()) {
+            fs::remove_file(&path)
+                .map_err(|err| format!("delete {}: {err}", display_path(&path)))?;
+            continue;
+        }
+
+        let conflict = conflict_sibling_path(&path, "local")?;
+        if let Some(parent) = conflict.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|err| format!("create {}: {err}", display_path(parent)))?;
+        }
+        fs::rename(&path, &conflict)
+            .or_else(|_| {
+                fs::copy(&path, &conflict)?;
+                fs::remove_file(&path)
+            })
+            .map_err(|err| format!("write delete conflict {}: {err}", display_path(&conflict)))?;
+        log_operation(
+            root,
+            "delete_conflict",
+            &tombstone.path,
+            &format!("{{\"deleted_at\":{}}}", tombstone.deleted_at),
+            "conflicted",
+        )?;
+        println!(
+            "conflict: remote deleted {}, kept local {}",
+            display_path(&path),
+            display_path(&conflict)
+        );
+    }
+
+    Ok(())
 }
 
 fn remote_node(node: &IndexNode) -> bool {
