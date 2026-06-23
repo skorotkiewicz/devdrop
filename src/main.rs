@@ -685,7 +685,8 @@ fn cmd_sync(args: &[String]) -> Result<(), String> {
 
 fn sync_local_index(root: &Path) -> Result<IndexSnapshot, String> {
     let rules = Rules::load(root)?;
-    let snapshot = collect_index(root, &rules)?;
+    let mut snapshot = collect_index(root, &rules)?;
+    carry_indexed_remote_nodes(root, &mut snapshot)?;
     write_index(root, &rules, &snapshot)?;
     Ok(snapshot)
 }
@@ -2791,6 +2792,53 @@ fn push_index_node(
         local_state: local_state_for(rel, action).to_string(),
         local_mtime: modified_secs(metadata),
     });
+
+    Ok(())
+}
+
+fn carry_indexed_remote_nodes(root: &Path, snapshot: &mut IndexSnapshot) -> Result<(), String> {
+    let db = db_path(root);
+    if !db.exists() {
+        return Ok(());
+    }
+
+    let mut present = snapshot
+        .nodes
+        .iter()
+        .map(|node| node.path.clone())
+        .collect::<HashSet<_>>();
+    for row in query_lines(
+        &db,
+        "SELECT hex(path)||char(9)||hex(kind)||char(9)||mode||char(9)||size||char(9)||ifnull(hex(content_hash),'')||char(9)||hex(local_state)||char(9)||ifnull(local_mtime,0) FROM nodes WHERE workspace_id='local' AND local_state IN ('remote-only','metadata-only','secret-locked') ORDER BY path;",
+    )? {
+        let fields = row.split('\t').collect::<Vec<_>>();
+        if fields.len() != 7 {
+            return Err("bad carried node row".into());
+        }
+        let path = hex_decode_string(fields[0])?;
+        if !present.insert(path.clone()) || root.join(&path).exists() {
+            continue;
+        }
+        snapshot.nodes.push(IndexNode {
+            id: node_id(&path),
+            parent_id: parent_rel(&path).map(|parent| node_id(&parent)),
+            path,
+            kind: hex_decode_string(fields[1])?,
+            mode: fields[2]
+                .parse()
+                .map_err(|err| format!("bad carried node mode: {err}"))?,
+            size: fields[3]
+                .parse()
+                .map_err(|err| format!("bad carried node size: {err}"))?,
+            content_hash: (!fields[4].is_empty())
+                .then(|| hex_decode_string(fields[4]))
+                .transpose()?,
+            local_state: hex_decode_string(fields[5])?,
+            local_mtime: fields[6]
+                .parse()
+                .map_err(|err| format!("bad carried node mtime: {err}"))?,
+        });
+    }
 
     Ok(())
 }

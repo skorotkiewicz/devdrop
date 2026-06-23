@@ -90,12 +90,24 @@ $DEVDROP device list | grep -q "test-device"
 $DEVDROP login testuser
 $DEVDROP device enroll "second-device"
 $DEVDROP sync "$TEST_WS2" --remote "$TEST_REMOTE"
+
+echo "=== Test 11c: Unhydrated push preserves remote namespace ===" >&2
+TEST_WS3="$TEMP_DIR/workspace3"
+mkdir -p "$TEST_WS3"
+$DEVDROP workspace init "$TEST_WS3"
+cd "$TEST_WS3"
+$DEVDROP sync "$TEST_WS3" --remote "$TEST_REMOTE" --pull
+$DEVDROP ls "$TEST_WS3/project/src" | grep -q "main.rs"
+$DEVDROP hydrate "$TEST_WS3/project/src/main.rs"
+grep -q "fn main" "$TEST_WS3/project/src/main.rs"
+echo "PASS: Unhydrated push preserves remote namespace"
+
 cd "$TEST_WS"
 $DEVDROP sync "$TEST_WS" --remote "$TEST_REMOTE" --pull
 $DEVDROP device list | grep -q "second-device"
 echo "PASS: Device state syncs"
 
-echo "=== Test 11c: Pull conflict keeps local and remote edits ===" >&2
+echo "=== Test 11d: Pull conflict keeps local and remote edits ===" >&2
 echo "remote edit" > "$TEST_WS/project/README.md"
 cd "$TEST_WS"
 $DEVDROP sync "$TEST_WS" --remote "$TEST_REMOTE"
@@ -109,7 +121,7 @@ test "$(cat "$CONFLICT_FILE")" = "remote edit"
 $DEVDROP conflicts "$TEST_WS2" | grep -q "README"
 echo "PASS: Pull conflict keeps both versions"
 
-echo "=== Test 11d: Remote delete conflict keeps local edit ===" >&2
+echo "=== Test 11e: Remote delete conflict keeps local edit ===" >&2
 rm "$TEST_WS/project/README.md"
 cd "$TEST_WS"
 $DEVDROP sync "$TEST_WS" --remote "$TEST_REMOTE"
