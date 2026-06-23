@@ -1,6 +1,9 @@
 [package]
 name = "devdrop"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [dependencies]
+
+[profile.release]
+lto = true
