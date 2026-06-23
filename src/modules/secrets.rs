@@ -1,10 +1,10 @@
-use crate::commands::{flag_value, required_path};
-use crate::crypto::{openssl_crypt, openssl_decrypt_to_string};
-use crate::db::{db_path, init_db, log_operation, query_lines, query_one, run_sql};
-use crate::fs_util::{display_path, find_workspace_root, pin_path, rel_or_dot, require_dir};
-use crate::index::parent_rel;
-use crate::util::{fnv_bytes, json_string, now_secs, sql_string};
-use std::env;
+use super::commands::{flag_value, required_path};
+use super::config::configured_secret_scope;
+use super::crypto::{openssl_crypt, openssl_decrypt_to_string};
+use super::db::{db_path, init_db, log_operation, query_lines, query_one, run_sql};
+use super::fs_util::{display_path, find_workspace_root, pin_path, rel_or_dot, require_dir};
+use super::index::parent_rel;
+use super::util::{fnv_bytes, hex_decode_string, json_string, now_nanos, now_secs, sql_string};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -13,26 +13,94 @@ pub fn cmd_secret(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("add") => {
             let path = required_path(args.get(1), "secret add")?;
-            let scope = flag_value(args, "--scope").unwrap_or("dev");
+            let scope = flag_value(args, "--scope");
             cmd_secret_add(&path, scope)
         }
         Some("request") => {
             let path = required_path(args.get(1), "secret request")?;
-            let scope = flag_value(args, "--scope").unwrap_or("dev");
+            let scope = flag_value(args, "--scope");
             cmd_secret_request(&path, scope)
         }
         Some("unlock") => {
             let path = required_path(args.get(1), "secret unlock")?;
-            let scope = flag_value(args, "--scope").unwrap_or("dev");
+            let scope = flag_value(args, "--scope");
             cmd_secret_unlock(&path, scope)
         }
         Some("lock") => {
             let path = required_path(args.get(1), "secret lock")?;
-            let scope = flag_value(args, "--scope").unwrap_or("dev");
+            let scope = flag_value(args, "--scope");
             cmd_secret_lock(&path, scope)
         }
-        _ => Err("usage: devdrop secret add|request|unlock|lock <path> [--scope <scope>]".into()),
+        _ => Err(
+            "usage: devdrop secret add|request|unlock|lock|set|list <path> [--scope <scope>]"
+                .into(),
+        ),
     }
+}
+
+pub fn cmd_secret_set(args: &[String]) -> Result<(), String> {
+    require_secret_key()?;
+    let kv = args
+        .get(1)
+        .ok_or("usage: devdrop secret set KEY=VALUE [--scope <scope>]")?;
+    let (key, value) = kv.split_once('=').ok_or("format: KEY=VALUE")?;
+    let cwd = std::env::current_dir().map_err(|err| format!("cwd: {err}"))?;
+    let root = find_workspace_root(&cwd)
+        .ok_or_else(|| "no workspace found; run `devdrop init <path>`".to_string())?;
+    let scope = secret_scope(&root, args, "--scope")?;
+    init_db(&root)?;
+    fs::create_dir_all(secret_store_path(&root))
+        .map_err(|err| format!("create secret vault: {err}"))?;
+
+    let rel = format!("secret:{key}");
+    let encrypted_path = secret_cipher_path(&root, &rel, &scope);
+
+    let temp = std::env::temp_dir().join(format!("devdrop_secret_{}", now_nanos()));
+    std::fs::write(&temp, value).map_err(|err| format!("write temp: {err}"))?;
+    openssl_crypt(false, &temp, &encrypted_path)?;
+    std::fs::remove_file(&temp).ok();
+
+    upsert_secret(&root, &rel, &scope, &encrypted_path, true)?;
+    log_operation(
+        &root,
+        "secret_set",
+        &rel,
+        &format!("{{\"key\":{}}}", json_string(key)),
+        "done",
+    )?;
+    println!("secret set: {key} scope={scope}");
+    Ok(())
+}
+
+pub fn cmd_secret_list(args: &[String]) -> Result<(), String> {
+    let cwd = std::env::current_dir().map_err(|err| format!("cwd: {err}"))?;
+    let root = find_workspace_root(&cwd)
+        .ok_or_else(|| "no workspace found; run `devdrop init <path>`".to_string())?;
+    let scope = secret_scope(&root, args, "--scope")?;
+    init_db(&root)?;
+    let db = db_path(&root);
+    if !db.exists() {
+        println!("no secrets");
+        return Ok(());
+    }
+
+    let sql = format!(
+        "SELECT hex(path) FROM secrets WHERE workspace_id='local' AND scope={} ORDER BY path;",
+        sql_string(&scope)
+    );
+    let rows = query_lines(&db, &sql)?;
+    if rows.is_empty() {
+        println!("no secrets in scope '{scope}'");
+        return Ok(());
+    }
+
+    for row in rows {
+        let path = hex_decode_string(&row)?;
+        if let Some(key) = path.strip_prefix("secret:") {
+            println!("{key}");
+        }
+    }
+    Ok(())
 }
 
 pub fn cmd_run(args: &[String]) -> Result<(), String> {
@@ -41,7 +109,7 @@ pub fn cmd_run(args: &[String]) -> Result<(), String> {
         .ok_or_else(|| {
             "usage: devdrop run --repo <path> --secret-scope <scope> -- <command>".to_string()
         })?;
-    let scope = flag_value(args, "--secret-scope").unwrap_or("dev");
+    let requested_scope = flag_value(args, "--secret-scope").map(str::to_string);
     let split = args.iter().position(|arg| arg == "--").ok_or_else(|| {
         "usage: devdrop run --repo <path> --secret-scope <scope> -- <command>".to_string()
     })?;
@@ -49,7 +117,7 @@ pub fn cmd_run(args: &[String]) -> Result<(), String> {
         .get(split + 1)
         .ok_or_else(|| "missing command after --".to_string())?;
     let command_args = &args[split + 2..];
-    let envs = secret_env_for_repo(&repo, scope)?;
+    let envs = secret_env_for_repo(&repo, requested_scope.as_deref())?;
     let mut child = Command::new(command);
     let status = child
         .args(command_args)
@@ -66,91 +134,95 @@ pub fn cmd_run(args: &[String]) -> Result<(), String> {
     }
 }
 
-fn cmd_secret_add(path: &Path, scope: &str) -> Result<(), String> {
+pub fn cmd_secret_add(path: &Path, scope: Option<&str>) -> Result<(), String> {
     require_secret_key()?;
     if !path.is_file() {
         return Err(format!("not a file: {}", display_path(path)));
     }
     let root = find_workspace_root(path)
         .ok_or_else(|| "no workspace found; run `devdrop init <path>`".to_string())?;
+    let scope = resolve_secret_scope(&root, scope);
     init_db(&root)?;
     fs::create_dir_all(secret_store_path(&root))
         .map_err(|err| format!("create secret vault: {err}"))?;
 
     let rel = pin_path(&root, path);
-    let encrypted_path = secret_cipher_path(&root, &rel, scope);
+    let encrypted_path = secret_cipher_path(&root, &rel, &scope);
     openssl_crypt(false, path, &encrypted_path)?;
-    upsert_secret(&root, &rel, scope, &encrypted_path, path.exists())?;
+    upsert_secret(&root, &rel, &scope, &encrypted_path, path.exists())?;
     log_operation(
         &root,
         "secret_add",
         &rel,
-        &format!("{{\"scope\":{}}}", json_string(scope)),
+        &format!("{{\"scope\":{}}}", json_string(&scope)),
         "done",
     )?;
     println!("secret added: {rel} scope={scope}");
     Ok(())
 }
 
-fn cmd_secret_unlock(path: &Path, scope: &str) -> Result<(), String> {
+pub fn cmd_secret_unlock(path: &Path, scope: Option<&str>) -> Result<(), String> {
     require_secret_key()?;
     let root = find_workspace_root(path)
         .ok_or_else(|| "no workspace found; run `devdrop init <path>`".to_string())?;
+    let scope = resolve_secret_scope(&root, scope);
     let rel = pin_path(&root, path);
-    let secret = lookup_secret(&root, &rel, scope)?;
+    let secret = lookup_secret(&root, &rel, &scope)?;
     openssl_crypt(true, &secret.encrypted_path, path)?;
-    upsert_secret(&root, &rel, scope, &secret.encrypted_path, true)?;
+    upsert_secret(&root, &rel, &scope, &secret.encrypted_path, true)?;
     log_operation(
         &root,
         "secret_unlock",
         &rel,
-        &format!("{{\"scope\":{}}}", json_string(scope)),
+        &format!("{{\"scope\":{}}}", json_string(&scope)),
         "done",
     )?;
     println!("secret unlocked: {rel} scope={scope}");
     Ok(())
 }
 
-fn cmd_secret_request(path: &Path, scope: &str) -> Result<(), String> {
+pub fn cmd_secret_request(path: &Path, scope: Option<&str>) -> Result<(), String> {
     require_secret_key()?;
     let root = find_workspace_root(path)
         .ok_or_else(|| "no workspace found; run `devdrop init <path>`".to_string())?;
+    let scope = resolve_secret_scope(&root, scope);
     let rel = pin_path(&root, path);
-    let secret = lookup_secret(&root, &rel, scope)?;
+    let secret = lookup_secret(&root, &rel, &scope)?;
     let plaintext = openssl_decrypt_to_string(&secret.encrypted_path)?;
     print!("{plaintext}");
     log_operation(
         &root,
         "secret_request",
         &rel,
-        &format!("{{\"scope\":{}}}", json_string(scope)),
+        &format!("{{\"scope\":{}}}", json_string(&scope)),
         "done",
     )?;
     Ok(())
 }
 
-fn cmd_secret_lock(path: &Path, scope: &str) -> Result<(), String> {
+pub fn cmd_secret_lock(path: &Path, scope: Option<&str>) -> Result<(), String> {
     let root = find_workspace_root(path)
         .ok_or_else(|| "no workspace found; run `devdrop init <path>`".to_string())?;
+    let scope = resolve_secret_scope(&root, scope);
     let rel = pin_path(&root, path);
-    let secret = lookup_secret(&root, &rel, scope)?;
+    let secret = lookup_secret(&root, &rel, &scope)?;
     if path.exists() {
         fs::remove_file(path).map_err(|err| format!("lock {}: {err}", display_path(path)))?;
     }
-    upsert_secret(&root, &rel, scope, &secret.encrypted_path, false)?;
+    upsert_secret(&root, &rel, &scope, &secret.encrypted_path, false)?;
     log_operation(
         &root,
         "secret_lock",
         &rel,
-        &format!("{{\"scope\":{}}}", json_string(scope)),
+        &format!("{{\"scope\":{}}}", json_string(&scope)),
         "done",
     )?;
     println!("secret locked: {rel} scope={scope}");
     Ok(())
 }
 
-struct SecretRow {
-    encrypted_path: PathBuf,
+pub struct SecretRow {
+    pub encrypted_path: PathBuf,
 }
 
 pub fn secret_store_path(root: &Path) -> PathBuf {
@@ -165,10 +237,8 @@ pub fn secret_cipher_path(root: &Path, rel: &str, scope: &str) -> PathBuf {
     ))
 }
 
-fn require_secret_key() -> Result<(), String> {
-    env::var("DEVDROP_SECRET_KEY")
-        .map(|_| ())
-        .map_err(|_| "DEVDROP_SECRET_KEY is required for secret commands".to_string())
+pub fn require_secret_key() -> Result<(), String> {
+    Ok(())
 }
 
 pub fn upsert_secret(
@@ -197,7 +267,7 @@ pub fn upsert_secret(
     run_sql(&db, &sql)
 }
 
-fn lookup_secret(root: &Path, rel: &str, scope: &str) -> Result<SecretRow, String> {
+pub fn lookup_secret(root: &Path, rel: &str, scope: &str) -> Result<SecretRow, String> {
     init_db(root)?;
     let db = db_path(root);
     if !db.exists() {
@@ -257,16 +327,70 @@ pub fn locked_secrets_in_dir(dir: &Path) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-fn secret_env_for_repo(repo: &Path, scope: &str) -> Result<Vec<(String, String)>, String> {
+pub fn secret_env_for_repo(
+    repo: &Path,
+    scope: Option<&str>,
+) -> Result<Vec<(String, String)>, String> {
     require_secret_key()?;
     require_dir(repo)?;
     let root = find_workspace_root(repo)
         .ok_or_else(|| "no workspace found; run `devdrop init <path>`".to_string())?;
+    let scope = scope
+        .map(str::to_string)
+        .or_else(|| configured_secret_scope(&root, "default").ok().flatten())
+        .unwrap_or_else(|| "dev".to_string());
     let path = repo.join(".env");
     let rel = pin_path(&root, &path);
-    let secret = lookup_secret(&root, &rel, scope)?;
-    let plaintext = openssl_decrypt_to_string(&secret.encrypted_path)?;
-    parse_env(&plaintext)
+    let mut envs = Vec::new();
+
+    if let Ok(secret) = lookup_secret(&root, &rel, &scope) {
+        let plaintext = openssl_decrypt_to_string(&secret.encrypted_path)?;
+        envs.extend(parse_env(&plaintext)?);
+    }
+
+    envs.extend(secret_key_values(&root, &scope)?);
+    Ok(envs)
+}
+
+pub fn secret_scope(root: &Path, args: &[String], flag: &str) -> Result<String, String> {
+    Ok(resolve_secret_scope(root, flag_value(args, flag)))
+}
+
+pub fn resolve_secret_scope(root: &Path, requested: Option<&str>) -> String {
+    requested
+        .map(str::to_string)
+        .or_else(|| configured_secret_scope(root, "default").ok().flatten())
+        .unwrap_or_else(|| "dev".to_string())
+}
+
+pub fn secret_key_values(root: &Path, scope: &str) -> Result<Vec<(String, String)>, String> {
+    init_db(root)?;
+    let db = db_path(root);
+    if !db.exists() {
+        return Ok(Vec::new());
+    }
+
+    let sql = format!(
+        "SELECT hex(path)||char(9)||hex(encrypted_path) FROM secrets WHERE workspace_id='local' AND scope={} AND path LIKE 'secret:%' ORDER BY path;",
+        sql_string(scope)
+    );
+    query_lines(&db, &sql)?
+        .into_iter()
+        .map(|row| {
+            let fields = row.split('\t').collect::<Vec<_>>();
+            if fields.len() != 2 {
+                return Err("bad secret env row".to_string());
+            }
+            let path = hex_decode_string(fields[0])?;
+            let key = path
+                .strip_prefix("secret:")
+                .ok_or_else(|| format!("bad secret key path: {path}"))?
+                .to_string();
+            let encrypted_path = PathBuf::from(hex_decode_string(fields[1])?);
+            let value = openssl_decrypt_to_string(&encrypted_path)?;
+            Ok((key, value))
+        })
+        .collect()
 }
 
 pub fn parse_env(text: &str) -> Result<Vec<(String, String)>, String> {
@@ -296,7 +420,7 @@ pub fn parse_env(text: &str) -> Result<Vec<(String, String)>, String> {
     Ok(envs)
 }
 
-fn unquote_env_value(value: &str) -> &str {
+pub fn unquote_env_value(value: &str) -> &str {
     value
         .strip_prefix('"')
         .and_then(|value| value.strip_suffix('"'))

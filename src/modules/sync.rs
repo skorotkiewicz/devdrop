@@ -1,10 +1,12 @@
-use crate::commands::{first_positional, flag_value, optional_path};
-use crate::fs_util::{display_path, workspace_root_for};
-use crate::index::{IndexSnapshot, carry_indexed_remote_nodes, collect_index, write_index};
-use crate::remote::{pull_remote, push_remote, read_remote_config, write_remote_config};
-use crate::rules::Rules;
-use crate::util::fnv_bytes;
-use std::path::{Path, PathBuf};
+use super::commands::{first_positional, flag_value, optional_path};
+use super::fs_util::{display_path, workspace_root_for};
+use super::index::{IndexSnapshot, carry_indexed_remote_nodes, collect_index, write_index};
+use super::remote::{
+    finish_remote, prepare_remote, pull_remote, push_remote, read_remote_config, write_remote_url,
+};
+use super::rules::Rules;
+use super::util::fnv_bytes;
+use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
@@ -12,7 +14,7 @@ pub fn cmd_daemon(args: &[String]) -> Result<(), String> {
     let root = optional_path(first_positional(args))?;
     let root = workspace_root_for(&root)?;
     let remote = flag_value(args, "--remote")
-        .map(PathBuf::from)
+        .map(str::to_string)
         .or_else(|| read_remote_config(&root).ok().flatten());
     let interval = flag_value(args, "--interval")
         .unwrap_or("2")
@@ -28,7 +30,7 @@ pub fn cmd_daemon(args: &[String]) -> Result<(), String> {
         interval,
         remote
             .as_ref()
-            .map(|path| format!(" remote={}", display_path(path)))
+            .map(|url| format!(" remote={url}"))
             .unwrap_or_default()
     );
 
@@ -40,8 +42,10 @@ pub fn cmd_daemon(args: &[String]) -> Result<(), String> {
         if last_signature != Some(signature) {
             write_index(&root, &rules, &snapshot)?;
             if let Some(remote) = &remote {
-                push_remote(&root, remote, &snapshot)?;
-                write_remote_config(&root, remote)?;
+                let handle = prepare_remote(&root, remote)?;
+                push_remote(&root, &handle.path, &snapshot)?;
+                finish_remote(&handle)?;
+                write_remote_url(&root, remote)?;
             }
             println!(
                 "daemon synced: nodes={} blobs={} repos={}",
@@ -66,24 +70,33 @@ pub fn cmd_sync(args: &[String]) -> Result<(), String> {
     let root = optional_path(first_positional(args))?;
     let root = workspace_root_for(&root)?;
     let remote = flag_value(args, "--remote")
-        .map(PathBuf::from)
+        .map(str::to_string)
         .or_else(|| read_remote_config(&root).ok().flatten());
 
     if args.iter().any(|arg| arg == "--pull") {
-        let remote = remote.ok_or_else(|| "sync --pull requires --remote <path>".to_string())?;
-        pull_remote(&root, &remote)?;
-        write_remote_config(&root, &remote)?;
-        println!("pulled remote manifest: {}", display_path(&remote));
+        let remote = remote.ok_or_else(|| "sync --pull requires --remote <url>".to_string())?;
+        let handle = prepare_remote(&root, &remote)?;
+        pull_remote(&root, &handle.path)?;
+        write_remote_url(&root, &remote)?;
+        println!("pulled remote manifest: {}", remote);
+        return Ok(());
+    }
+
+    if let Some(remote) = remote {
+        let handle = prepare_remote(&root, &remote)?;
+        pull_remote(&root, &handle.path)?;
+        let snapshot = sync_local_index(&root)?;
+        push_remote(&root, &handle.path, &snapshot)?;
+        finish_remote(&handle)?;
+        write_remote_url(&root, &remote)?;
+        println!("synced remote: {}", handle.url);
+        println!("nodes: {}", snapshot.nodes.len());
+        println!("blobs: {}", snapshot.blobs.len());
+        println!("repos: {}", snapshot.repos.len());
         return Ok(());
     }
 
     let snapshot = sync_local_index(&root)?;
-    if let Some(remote) = remote {
-        push_remote(&root, &remote, &snapshot)?;
-        write_remote_config(&root, &remote)?;
-        println!("pushed remote manifest: {}", display_path(&remote));
-    }
-
     println!("synced local index: {}", display_path(&root));
     println!("nodes: {}", snapshot.nodes.len());
     println!("blobs: {}", snapshot.blobs.len());
@@ -91,7 +104,7 @@ pub fn cmd_sync(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn sync_local_index(root: &Path) -> Result<IndexSnapshot, String> {
+pub fn sync_local_index(root: &Path) -> Result<IndexSnapshot, String> {
     let rules = Rules::load(root)?;
     let mut snapshot = collect_index(root, &rules)?;
     carry_indexed_remote_nodes(root, &mut snapshot)?;
@@ -99,7 +112,7 @@ fn sync_local_index(root: &Path) -> Result<IndexSnapshot, String> {
     Ok(snapshot)
 }
 
-fn snapshot_signature(snapshot: &IndexSnapshot) -> u64 {
+pub fn snapshot_signature(snapshot: &IndexSnapshot) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     let mut nodes = snapshot.nodes.iter().collect::<Vec<_>>();
     nodes.sort_by(|left, right| left.path.cmp(&right.path));

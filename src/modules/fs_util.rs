@@ -1,3 +1,4 @@
+use super::config::load_config;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -26,7 +27,7 @@ pub fn sync_tree(src: &Path, dest: &Path) -> Result<(), String> {
     copy_tree(src, dest)
 }
 
-fn prune_missing(src_root: &Path, dest_root: &Path, current_dest: &Path) -> Result<(), String> {
+pub fn prune_missing(src_root: &Path, dest_root: &Path, current_dest: &Path) -> Result<(), String> {
     for entry in fs::read_dir(current_dest)
         .map_err(|err| format!("read {}: {err}", display_path(current_dest)))?
     {
@@ -57,7 +58,7 @@ fn prune_missing(src_root: &Path, dest_root: &Path, current_dest: &Path) -> Resu
     Ok(())
 }
 
-fn copy_tree_inner(root: &Path, dest_root: &Path, current: &Path) -> Result<(), String> {
+pub fn copy_tree_inner(root: &Path, dest_root: &Path, current: &Path) -> Result<(), String> {
     for entry in
         fs::read_dir(current).map_err(|err| format!("read {}: {err}", display_path(current)))?
     {
@@ -142,17 +143,22 @@ pub fn pin_path(root: &Path, path: &Path) -> String {
 
 pub fn read_pins(root: &Path) -> Result<Vec<String>, String> {
     let path = root.join(".devdrop/pins");
-    if !path.exists() {
-        return Ok(Vec::new());
+    let mut pins = Vec::new();
+
+    if path.exists() {
+        let text = fs::read_to_string(&path).map_err(|err| format!("read pins: {err}"))?;
+        pins.extend(
+            text.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(String::from),
+        );
     }
 
-    let text = fs::read_to_string(&path).map_err(|err| format!("read pins: {err}"))?;
-    Ok(text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(String::from)
-        .collect())
+    pins.extend(load_config(root)?.pins);
+    pins.sort();
+    pins.dedup();
+    Ok(pins)
 }
 
 pub fn write_pins(path: &Path, pins: &[String]) -> Result<(), String> {

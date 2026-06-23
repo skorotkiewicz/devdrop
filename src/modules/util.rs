@@ -59,7 +59,7 @@ pub fn hex_decode_string(text: &str) -> Result<String, String> {
     String::from_utf8(hex_decode(text)?).map_err(|err| format!("bad utf-8 hex: {err}"))
 }
 
-fn hex_nibble(byte: u8) -> Result<u8, String> {
+pub fn hex_nibble(byte: u8) -> Result<u8, String> {
     match byte {
         b'0'..=b'9' => Ok(byte - b'0'),
         b'a'..=b'f' => Ok(byte - b'a' + 10),

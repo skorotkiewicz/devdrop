@@ -1,7 +1,6 @@
+use devdrop::run;
 use std::env;
 use std::process::ExitCode;
-
-use devdrop::run;
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();

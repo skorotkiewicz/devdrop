@@ -1,4 +1,4 @@
-use crate::util::{fnv_bytes, now_secs, sql_string};
+use super::util::{fnv_bytes, now_secs, sql_string};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

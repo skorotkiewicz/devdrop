@@ -1,18 +1,3 @@
-mod agent;
-mod commands;
-mod crypto;
-mod db;
-mod fs_util;
-mod git;
-mod index;
-mod remote;
-mod rules;
-mod secrets;
-mod sync;
-mod util;
-mod workspace;
+mod modules;
 
-#[cfg(test)]
-mod tests;
-
-pub use commands::run;
+pub use modules::commands::run;

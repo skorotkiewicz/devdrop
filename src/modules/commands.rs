@@ -1,11 +1,12 @@
-use crate::agent::{cmd_agent, cmd_overlay};
-use crate::git::{cmd_repo, cmd_repo_status};
-use crate::remote::{cmd_conflicts, cmd_remote};
-use crate::secrets::{cmd_run, cmd_secret};
-use crate::sync::{cmd_daemon, cmd_sync};
-use crate::workspace::{
-    cmd_device, cmd_doctor, cmd_history, cmd_hydrate, cmd_ignored, cmd_init, cmd_login, cmd_ls,
-    cmd_pin, cmd_recover, cmd_status, cmd_workspace,
+use super::agent::{cmd_agent, cmd_overlay};
+use super::config::{cmd_config_get, cmd_config_set, cmd_remote_add, cmd_remote_ls};
+use super::git::{cmd_repo, cmd_repo_status};
+use super::remote::{cmd_conflicts, cmd_remote};
+use super::secrets::{cmd_run, cmd_secret, cmd_secret_list, cmd_secret_set};
+use super::sync::{cmd_daemon, cmd_sync};
+use super::workspace::{
+    cmd_device, cmd_doctor, cmd_edit, cmd_history, cmd_hydrate, cmd_ignored, cmd_init, cmd_login,
+    cmd_ls, cmd_pin, cmd_recover, cmd_status, cmd_workspace,
 };
 use std::env;
 use std::path::PathBuf;
@@ -25,8 +26,17 @@ pub fn run(args: &[String]) -> Result<(), String> {
         Some("workspace") => cmd_workspace(&args[1..]),
         Some("device") => cmd_device(&args[1..]),
         Some("repo") => cmd_repo(&args[1..]),
-        Some("remote") => cmd_remote(&args[1..]),
-        Some("secret") => cmd_secret(&args[1..]),
+        Some("remote") => match args.get(1).map(String::as_str) {
+            Some("add") => cmd_remote_add(&args[1..]),
+            Some("ls") => cmd_remote_ls(&args[1..]),
+            _ => cmd_remote(&args[1..]),
+        },
+        Some("secret") => match args.get(1).map(String::as_str) {
+            Some("set") => cmd_secret_set(&args[1..]),
+            Some("list") => cmd_secret_list(&args[1..]),
+            _ => cmd_secret(&args[1..]),
+        },
+        Some("edit") => cmd_edit(optional_path(args.get(1))?),
         Some("agent") => cmd_agent(&args[1..]),
         Some("overlay") => cmd_overlay(&args[1..]),
         Some("run") => cmd_run(&args[1..]),
@@ -43,39 +53,49 @@ pub fn run(args: &[String]) -> Result<(), String> {
         Some("recover") => cmd_recover(&args[1..]),
         Some("pin") => cmd_pin(required_path(args.get(1), "pin")?, true),
         Some("unpin") => cmd_pin(required_path(args.get(1), "unpin")?, false),
+        Some("config") => match args.get(1).map(String::as_str) {
+            Some("get") => cmd_config_get(&args[1..]),
+            Some("set") => cmd_config_set(&args[1..]),
+            _ => Err("usage: devdrop config get|set <key> [value]".into()),
+        },
         Some(other) => Err(format!("unknown command `{other}`; run `devdrop help`")),
     }
 }
 
-fn print_help() {
+pub fn print_help() {
     println!(
         "\
 devdrop - local-first workspace helper
 
 Usage:
-  devdrop init [path] [--remote <path>]
-  devdrop status [path] [--json]
-  devdrop sync [path] [--remote <path>] [--pull]
-  devdrop run --repo <path> [--secret-scope <scope>] -- <command>
-  devdrop agent create --repo <path> [--write-scope <scope>] [--secret-scope <scope>]
+  devdrop init [path] [--remote <url>]
+  devdrop sync
+  devdrop status
+  devdrop config get|set <key> [value]
+  devdrop remote add <url> | ls
+  devdrop secret set <key>=<value> [--scope <scope>]
+  devdrop secret list
+  devdrop edit [path]
   devdrop help more"
     );
 }
 
-fn print_more_help() {
+pub fn print_more_help() {
     println!(
         "\
-devdrop - more commands
+devdrop - advanced commands
 
 Usage:
-  devdrop init [path] [--remote <path>]
+  devdrop init [path] [--remote <url>]
   devdrop login [user]
   devdrop workspace init|mount <path>
   devdrop device enroll <name>
   devdrop device list
   devdrop repo update [path]
-  devdrop remote init <path>
+  devdrop remote init <path> | add <url> | ls
   devdrop secret add <path> --scope <scope>
+  devdrop secret set <key>=<value> [--scope <scope>]
+  devdrop secret list
   devdrop secret request <path> [--scope <scope>]
   devdrop secret unlock <path> [--scope <scope>]
   devdrop secret lock <path> [--scope <scope>]
@@ -87,8 +107,8 @@ Usage:
   devdrop overlay diff [agent-id]
   devdrop overlay submit [agent-id]
   devdrop run --repo <path> [--secret-scope <scope>] -- <command>
-  devdrop daemon [path] [--remote <path>] [--interval <seconds>] [--once]
-  devdrop sync [path] [--remote <path>] [--pull]
+  devdrop daemon [path] [--remote <url>] [--interval <seconds>] [--once]
+  devdrop sync
   devdrop status [path] [--json]
   devdrop ls [path]
   devdrop ignored [path]
@@ -100,7 +120,9 @@ Usage:
   devdrop recover <path> [--hash <content-hash>]
   devdrop pin <path>
   devdrop unpin <path>
-  devdrop doctor [path]"
+  devdrop doctor [path]
+  devdrop config get|set <key> [value]
+  devdrop edit [path]"
     );
 }
 

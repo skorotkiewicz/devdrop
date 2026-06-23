@@ -1,23 +1,25 @@
-use crate::commands::{flag_value, optional_path, required_path};
-use crate::db::{db_path, init_db, log_operation, operation_sql, query_lines, run_sql};
-use crate::fs_util::{
+use super::commands::{flag_value, optional_path, required_path};
+use super::config::{configured_remote_url, set_remote_url};
+use super::db::{db_path, init_db, log_operation, operation_sql, query_lines, query_one, run_sql};
+use super::fs_util::{
     display_path, find_workspace_root, pin_path, read_pins, rel_path, require_dir,
 };
-use crate::index::{
+use super::index::{
     IndexNode, IndexSnapshot, file_hash, file_version_sql, is_conflict_path, mark_node_local,
     node_id, object_path, object_store_path, parent_rel, walk_dirs,
 };
-use crate::rules::Rules;
-use crate::secrets::{secret_cipher_path, secret_store_path, upsert_secret};
-use crate::util::{
-    hex_decode, hex_decode_string, hex_encode, json_string, now_nanos, now_secs, sql_optional,
-    sql_string,
+use super::rules::Rules;
+use super::secrets::{secret_cipher_path, secret_store_path, upsert_secret};
+use super::util::{
+    fnv_bytes, hex_decode, hex_decode_string, hex_encode, json_string, now_nanos, now_secs,
+    sql_optional, sql_string,
 };
-use crate::workspace::init_workspace_storage;
-use std::collections::HashSet;
+use super::workspace::init_workspace_storage;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 pub fn cmd_remote(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
@@ -60,7 +62,7 @@ pub fn cmd_conflicts(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_conflicts_resolve(path: &Path, choice: &str) -> Result<(), String> {
+pub fn cmd_conflicts_resolve(path: &Path, choice: &str) -> Result<(), String> {
     let pair = conflict_pair(path)?;
     let root = find_workspace_root(&pair.base)
         .or_else(|| find_workspace_root(&pair.conflict))
@@ -99,12 +101,12 @@ fn cmd_conflicts_resolve(path: &Path, choice: &str) -> Result<(), String> {
     Ok(())
 }
 
-struct ConflictPair {
-    base: PathBuf,
-    conflict: PathBuf,
+pub struct ConflictPair {
+    pub base: PathBuf,
+    pub conflict: PathBuf,
 }
 
-fn conflict_pair(path: &Path) -> Result<ConflictPair, String> {
+pub fn conflict_pair(path: &Path) -> Result<ConflictPair, String> {
     if is_conflict_path(&pin_path(Path::new(""), path)) {
         let base = conflict_base_path(path)?;
         if !path.exists() {
@@ -153,6 +155,15 @@ pub fn conflict_base_path(path: &Path) -> Result<PathBuf, String> {
         .file_name()
         .ok_or_else(|| format!("no filename for {}", display_path(path)))?
         .to_string_lossy();
+    if let Some(start) = name.rfind(".conflict-") {
+        let end = name[start + ".conflict-".len()..]
+            .rfind('.')
+            .map(|end| start + ".conflict-".len() + end)
+            .unwrap_or(name.len());
+        let base_name = format!("{}{}", &name[..start], &name[end..]);
+        return Ok(path.with_file_name(base_name));
+    }
+
     let start = name
         .find(" (conflict from ")
         .ok_or_else(|| format!("not a conflict path: {}", display_path(path)))?;
@@ -164,7 +175,7 @@ pub fn conflict_base_path(path: &Path) -> Result<PathBuf, String> {
     Ok(path.with_file_name(base_name))
 }
 
-fn archive_conflict_file(root: &Path, path: &Path) -> Result<PathBuf, String> {
+pub fn archive_conflict_file(root: &Path, path: &Path) -> Result<PathBuf, String> {
     if !path.exists() {
         return Err(format!(
             "cannot archive missing file: {}",
@@ -191,7 +202,7 @@ fn archive_conflict_file(root: &Path, path: &Path) -> Result<PathBuf, String> {
     Ok(archive)
 }
 
-fn init_remote_storage(remote: &Path) -> Result<(), String> {
+pub fn init_remote_storage(remote: &Path) -> Result<(), String> {
     fs::create_dir_all(remote_manifest_dir(remote))
         .map_err(|err| format!("create remote manifest dir: {err}"))?;
     fs::create_dir_all(remote_objects_path(remote))
@@ -201,47 +212,144 @@ fn init_remote_storage(remote: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn remote_config_path(root: &Path) -> PathBuf {
+pub fn remote_config_path(root: &Path) -> PathBuf {
     root.join(".devdrop/remote")
 }
 
-fn remote_manifest_dir(remote: &Path) -> PathBuf {
+pub fn remote_manifest_dir(remote: &Path) -> PathBuf {
     remote.join("manifests")
 }
 
-fn remote_manifest_path(remote: &Path) -> PathBuf {
+pub fn remote_manifest_path(remote: &Path) -> PathBuf {
     remote_manifest_dir(remote).join("latest.tsv")
 }
 
-fn remote_objects_path(remote: &Path) -> PathBuf {
+pub fn remote_objects_path(remote: &Path) -> PathBuf {
     remote.join("objects")
 }
 
-fn remote_object_path(remote: &Path, hash: &str) -> PathBuf {
+pub fn remote_object_path(remote: &Path, hash: &str) -> PathBuf {
     remote_objects_path(remote).join(hash.replace(':', "_"))
 }
 
-fn remote_secrets_path(remote: &Path) -> PathBuf {
+pub fn remote_secrets_path(remote: &Path) -> PathBuf {
     remote.join("secrets")
 }
 
-fn remote_devices_path(remote: &Path) -> PathBuf {
+pub fn remote_devices_path(remote: &Path) -> PathBuf {
     remote.join("devices.tsv")
 }
 
-fn remote_tombstones_path(remote: &Path) -> PathBuf {
+pub fn remote_tombstones_path(remote: &Path) -> PathBuf {
     remote.join("tombstones.tsv")
 }
 
-pub fn write_remote_config(root: &Path, remote: &Path) -> Result<(), String> {
-    fs::write(
-        remote_config_path(root),
-        remote.to_string_lossy().as_bytes(),
-    )
-    .map_err(|err| format!("write remote config: {err}"))
+pub struct RemoteHandle {
+    pub url: String,
+    pub path: PathBuf,
+    ssh: Option<SshRemote>,
 }
 
-pub fn read_remote_config(root: &Path) -> Result<Option<PathBuf>, String> {
+struct SshRemote {
+    host: String,
+    path: String,
+}
+
+pub fn prepare_remote(root: &Path, url: &str) -> Result<RemoteHandle, String> {
+    if let Some(ssh) = parse_ssh_remote(url)? {
+        let path = root
+            .join(".devdrop/remote-cache")
+            .join(format!("{:016x}", fnv_bytes(url.as_bytes())));
+        fs::create_dir_all(&path).map_err(|err| format!("create ssh remote cache: {err}"))?;
+        run_checked(
+            Command::new("ssh")
+                .arg(&ssh.host)
+                .arg("mkdir")
+                .arg("-p")
+                .arg(&ssh.path),
+            "ssh mkdir remote",
+        )?;
+        run_checked(
+            Command::new("rsync")
+                .arg("-az")
+                .arg("--delete")
+                .arg(format!("{}:{}/", ssh.host, ssh.path))
+                .arg(format!("{}/", path.to_string_lossy())),
+            "rsync pull remote",
+        )?;
+        return Ok(RemoteHandle {
+            url: url.to_string(),
+            path,
+            ssh: Some(ssh),
+        });
+    }
+
+    Ok(RemoteHandle {
+        url: url.to_string(),
+        path: local_remote_path(url),
+        ssh: None,
+    })
+}
+
+pub fn finish_remote(remote: &RemoteHandle) -> Result<(), String> {
+    let Some(ssh) = &remote.ssh else {
+        return Ok(());
+    };
+    run_checked(
+        Command::new("rsync")
+            .arg("-az")
+            .arg("--delete")
+            .arg(format!("{}/", remote.path.to_string_lossy()))
+            .arg(format!("{}:{}/", ssh.host, ssh.path)),
+        "rsync push remote",
+    )
+}
+
+fn parse_ssh_remote(url: &str) -> Result<Option<SshRemote>, String> {
+    let Some(rest) = url.strip_prefix("ssh://") else {
+        return Ok(None);
+    };
+    let (host, path) = rest
+        .split_once('/')
+        .ok_or_else(|| "ssh remote must look like ssh://host/path".to_string())?;
+    if host.is_empty() || path.is_empty() {
+        return Err("ssh remote must look like ssh://host/path".into());
+    }
+    Ok(Some(SshRemote {
+        host: host.to_string(),
+        path: format!("/{path}"),
+    }))
+}
+
+fn local_remote_path(url: &str) -> PathBuf {
+    PathBuf::from(url.strip_prefix("file://").unwrap_or(url))
+}
+
+fn run_checked(command: &mut Command, label: &str) -> Result<(), String> {
+    let output = command.output().map_err(|err| format!("{label}: {err}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Err(if stderr.is_empty() {
+        format!("{label}: {stdout}")
+    } else {
+        format!("{label}: {stderr}")
+    })
+}
+
+pub fn write_remote_url(root: &Path, url: &str) -> Result<(), String> {
+    set_remote_url(root, url, true)?;
+    fs::write(remote_config_path(root), url.as_bytes())
+        .map_err(|err| format!("write remote config: {err}"))
+}
+
+pub fn read_remote_config(root: &Path) -> Result<Option<String>, String> {
+    if let Some(url) = configured_remote_url(root)? {
+        return Ok(Some(url));
+    }
+
     let path = remote_config_path(root);
     if !path.exists() {
         return Ok(None);
@@ -249,10 +357,10 @@ pub fn read_remote_config(root: &Path) -> Result<Option<PathBuf>, String> {
 
     let text = fs::read_to_string(&path).map_err(|err| format!("read remote config: {err}"))?;
     let text = text.trim();
-    Ok((!text.is_empty()).then(|| PathBuf::from(text)))
+    Ok((!text.is_empty()).then(|| text.to_string()))
 }
 
-fn push_remote_devices(root: &Path, remote: &Path) -> Result<(), String> {
+pub fn push_remote_devices(root: &Path, remote: &Path) -> Result<(), String> {
     let manifest_path = remote_devices_path(remote);
 
     let mut lines_to_write = Vec::new();
@@ -291,7 +399,7 @@ fn push_remote_devices(root: &Path, remote: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn pull_remote_devices(root: &Path, remote: &Path) -> Result<(), String> {
+pub fn pull_remote_devices(root: &Path, remote: &Path) -> Result<(), String> {
     let manifest = remote_devices_path(remote);
     if !manifest.exists() {
         return Ok(());
@@ -333,7 +441,8 @@ fn pull_remote_devices(root: &Path, remote: &Path) -> Result<(), String> {
 pub fn fetch_remote_object(root: &Path, hash: &str) -> Result<(), String> {
     let remote = read_remote_config(root)?
         .ok_or_else(|| format!("object {hash} is not local and no remote is configured"))?;
-    let src = remote_object_path(&remote, hash);
+    let handle = prepare_remote(root, &remote)?;
+    let src = remote_object_path(&handle.path, hash);
     if !src.exists() {
         return Err(format!("remote object missing: {}", display_path(&src)));
     }
@@ -344,7 +453,7 @@ pub fn fetch_remote_object(root: &Path, hash: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn push_remote_secrets(root: &Path, remote: &Path) -> Result<(), String> {
+pub fn push_remote_secrets(root: &Path, remote: &Path) -> Result<(), String> {
     let manifest_path = remote.join("secrets.tsv");
 
     let mut lines_to_write = Vec::new();
@@ -406,7 +515,7 @@ fn push_remote_secrets(root: &Path, remote: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn pull_remote_secrets(root: &Path, remote: &Path) -> Result<(), String> {
+pub fn pull_remote_secrets(root: &Path, remote: &Path) -> Result<(), String> {
     let manifest = remote.join("secrets.tsv");
     if !manifest.exists() {
         return Ok(());
@@ -512,8 +621,11 @@ pub fn push_remote(root: &Path, remote: &Path, snapshot: &IndexSnapshot) -> Resu
 
 pub fn pull_remote(root: &Path, remote: &Path) -> Result<(), String> {
     init_workspace_storage(root)?;
-    let nodes = read_remote_manifest(remote)?;
+    let previous_local_hashes = indexed_local_content_hashes(root)?;
+    let mut nodes = read_remote_manifest(remote)?;
     let tombstones = read_remote_tombstones(remote)?;
+    let local_deletes =
+        remove_locally_deleted_remote_nodes(root, &mut nodes, &previous_local_hashes);
 
     for node in &nodes {
         if matches!(node.kind.as_str(), "directory" | "repo") && node.path != "." {
@@ -527,11 +639,69 @@ pub fn pull_remote(root: &Path, remote: &Path) -> Result<(), String> {
     materialize_pull_conflicts(root, remote, &nodes)?;
     apply_remote_tombstones(root, &tombstones)?;
     write_pulled_index(root, &nodes)?;
-    hydrate_pins_from_remote(root, remote, &nodes)?;
+    record_local_tombstones(root, &local_deletes)?;
+    hydrate_pins_from_remote(root, remote, &nodes, &previous_local_hashes)?;
     Ok(())
 }
 
-fn materialize_pull_conflicts(
+pub struct LocalDelete {
+    pub path: String,
+    pub content_hash: String,
+}
+
+pub fn remove_locally_deleted_remote_nodes(
+    root: &Path,
+    nodes: &mut Vec<RemoteNode>,
+    previous_local_hashes: &HashMap<String, String>,
+) -> Vec<LocalDelete> {
+    let mut deletes = Vec::new();
+    nodes.retain(|node| {
+        let Some(hash) = &node.content_hash else {
+            return true;
+        };
+        let locally_deleted = node.kind == "file"
+            && !root.join(&node.path).exists()
+            && previous_local_hashes
+                .get(&node.path)
+                .is_some_and(|previous| previous == hash);
+        if locally_deleted {
+            deletes.push(LocalDelete {
+                path: node.path.clone(),
+                content_hash: hash.clone(),
+            });
+            return false;
+        }
+        true
+    });
+    deletes
+}
+
+pub fn record_local_tombstones(root: &Path, deletes: &[LocalDelete]) -> Result<(), String> {
+    if deletes.is_empty() {
+        return Ok(());
+    }
+
+    init_db(root)?;
+    let now = now_secs();
+    let mut sql = String::from("BEGIN;\n");
+    for delete in deletes {
+        sql.push_str(&format!(
+            "INSERT OR IGNORE INTO tombstones (id, workspace_id, path, content_hash, deleted_at) VALUES ({}, 'local', {}, {}, {});\n",
+            sql_string(&format!(
+                "tombstone_{:016x}_{}",
+                fnv_bytes(delete.path.as_bytes()),
+                now
+            )),
+            sql_string(&delete.path),
+            sql_optional(Some(delete.content_hash.as_str())),
+            now
+        ));
+    }
+    sql.push_str("COMMIT;\n");
+    run_sql(&db_path(root), &sql)
+}
+
+pub fn materialize_pull_conflicts(
     root: &Path,
     remote: &Path,
     nodes: &[RemoteNode],
@@ -549,6 +719,10 @@ fn materialize_pull_conflicts(
         if &local_hash == hash {
             continue;
         }
+        let indexed_hash = indexed_content_hash(root, &node.path)?;
+        if indexed_hash.as_deref() == Some(hash.as_str()) {
+            continue;
+        }
 
         let object = object_path(root, hash);
         if !object.exists() {
@@ -556,6 +730,20 @@ fn materialize_pull_conflicts(
             fs::copy(&remote_object, &object).map_err(|err| {
                 format!("copy remote object {}: {err}", display_path(&remote_object))
             })?;
+        }
+
+        if indexed_hash.as_deref() == Some(local_hash.as_str()) {
+            fs::copy(&object, &path)
+                .map_err(|err| format!("update {} from remote: {err}", display_path(&path)))?;
+            log_operation(
+                root,
+                "pull_update",
+                &node.path,
+                &format!("{{\"remote_hash\":{}}}", json_string(hash)),
+                "done",
+            )?;
+            println!("updated from remote: {}", display_path(&path));
+            continue;
         }
 
         let conflict = conflict_sibling_path(&path, "remote")?;
@@ -582,7 +770,42 @@ fn materialize_pull_conflicts(
     Ok(())
 }
 
-fn conflict_sibling_path(path: &Path, source: &str) -> Result<PathBuf, String> {
+pub fn indexed_content_hash(root: &Path, rel: &str) -> Result<Option<String>, String> {
+    let db = db_path(root);
+    if !db.exists() {
+        return Ok(None);
+    }
+    query_one(
+        &db,
+        &format!(
+            "SELECT content_hash FROM nodes WHERE workspace_id='local' AND path={} AND content_hash IS NOT NULL LIMIT 1;",
+            sql_string(rel)
+        ),
+    )
+}
+
+pub fn indexed_local_content_hashes(root: &Path) -> Result<HashMap<String, String>, String> {
+    let db = db_path(root);
+    if !db.exists() {
+        return Ok(HashMap::new());
+    }
+
+    query_lines(
+        &db,
+        "SELECT hex(path)||char(9)||hex(content_hash) FROM nodes WHERE workspace_id='local' AND local_state='local' AND content_hash IS NOT NULL;",
+    )?
+    .into_iter()
+    .map(|row| {
+        let fields = row.split('\t').collect::<Vec<_>>();
+        if fields.len() != 2 {
+            return Err("bad indexed local content row".to_string());
+        }
+        Ok((hex_decode_string(fields[0])?, hex_decode_string(fields[1])?))
+    })
+    .collect()
+}
+
+pub fn conflict_sibling_path(path: &Path, source: &str) -> Result<PathBuf, String> {
     let name = path
         .file_name()
         .ok_or_else(|| format!("no filename for {}", display_path(path)))?
@@ -591,30 +814,35 @@ fn conflict_sibling_path(path: &Path, source: &str) -> Result<PathBuf, String> {
         .rfind('.')
         .filter(|index| *index > 0)
         .unwrap_or(name.len());
-    let marker = format!(" (conflict from {source} {})", now_nanos());
+    let marker = format!(".conflict-{source}-{}", now_nanos());
     Ok(path.with_file_name(format!("{}{}{}", &name[..split], marker, &name[split..])))
 }
 
-fn hydrate_pins_from_remote(
+pub fn hydrate_pins_from_remote(
     root: &Path,
     remote: &Path,
     nodes: &[RemoteNode],
+    previous_local_hashes: &HashMap<String, String>,
 ) -> Result<(), String> {
     let pins = read_pins(root)?;
-    if pins.is_empty() {
-        return Ok(());
-    }
+    let hydrate_all = pins.is_empty();
 
     for node in nodes.iter().filter(|node| node.kind == "file") {
         let Some(hash) = &node.content_hash else {
             continue;
         };
-        if !pins.iter().any(|pin| pin_matches(pin, &node.path)) {
+        if !hydrate_all && !pins.iter().any(|pin| pin_matches(pin, &node.path)) {
             continue;
         }
 
         let path = root.join(&node.path);
         if path.exists() {
+            continue;
+        }
+        if previous_local_hashes
+            .get(&node.path)
+            .is_some_and(|previous| previous == hash)
+        {
             continue;
         }
 
@@ -630,16 +858,16 @@ fn hydrate_pins_from_remote(
                 .map_err(|err| format!("create {}: {err}", display_path(parent)))?;
         }
         fs::copy(&object, &path)
-            .map_err(|err| format!("hydrate pinned {}: {err}", display_path(&path)))?;
+            .map_err(|err| format!("hydrate {}: {err}", display_path(&path)))?;
         mark_node_local(root, &node.path)?;
-        log_operation(root, "hydrate_pinned", &node.path, "{}", "done")?;
-        println!("hydrated pinned: {}", display_path(&path));
+        log_operation(root, "hydrate_remote", &node.path, "{}", "done")?;
+        println!("hydrated: {}", display_path(&path));
     }
 
     Ok(())
 }
 
-fn pin_matches(pin: &str, rel: &str) -> bool {
+pub fn pin_matches(pin: &str, rel: &str) -> bool {
     pin == "."
         || rel == pin
         || rel
@@ -647,13 +875,13 @@ fn pin_matches(pin: &str, rel: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-struct RemoteTombstone {
-    path: String,
-    content_hash: Option<String>,
-    deleted_at: i64,
+pub struct RemoteTombstone {
+    pub path: String,
+    pub content_hash: Option<String>,
+    pub deleted_at: i64,
 }
 
-fn push_remote_tombstones(root: &Path, remote: &Path) -> Result<(), String> {
+pub fn push_remote_tombstones(root: &Path, remote: &Path) -> Result<(), String> {
     let manifest_path = remote_tombstones_path(remote);
 
     let mut lines_to_write = Vec::new();
@@ -703,7 +931,7 @@ fn push_remote_tombstones(root: &Path, remote: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn read_remote_tombstones(remote: &Path) -> Result<Vec<RemoteTombstone>, String> {
+pub fn read_remote_tombstones(remote: &Path) -> Result<Vec<RemoteTombstone>, String> {
     let path = remote_tombstones_path(remote);
     if !path.exists() {
         return Ok(Vec::new());
@@ -735,7 +963,7 @@ fn read_remote_tombstones(remote: &Path) -> Result<Vec<RemoteTombstone>, String>
         .collect()
 }
 
-fn apply_remote_tombstones(root: &Path, tombstones: &[RemoteTombstone]) -> Result<(), String> {
+pub fn apply_remote_tombstones(root: &Path, tombstones: &[RemoteTombstone]) -> Result<(), String> {
     for tombstone in tombstones {
         let path = root.join(&tombstone.path);
         if !path.is_file() {
@@ -777,23 +1005,25 @@ fn apply_remote_tombstones(root: &Path, tombstones: &[RemoteTombstone]) -> Resul
     Ok(())
 }
 
-fn remote_node(node: &IndexNode) -> bool {
-    !matches!(node.local_state.as_str(), "local-only" | "ignored")
-        && node.path != ".devdrop"
+pub fn remote_node(node: &IndexNode) -> bool {
+    !matches!(
+        node.local_state.as_str(),
+        "local-only" | "ignored" | "conflicted"
+    ) && node.path != ".devdrop"
         && !node.path.starts_with(".devdrop/")
 }
 
-struct RemoteNode {
-    path: String,
-    kind: String,
-    mode: u32,
-    size: u64,
-    content_hash: Option<String>,
-    local_state: String,
-    local_mtime: i64,
+pub struct RemoteNode {
+    pub path: String,
+    pub kind: String,
+    pub mode: u32,
+    pub size: u64,
+    pub content_hash: Option<String>,
+    pub local_state: String,
+    pub local_mtime: i64,
 }
 
-fn read_remote_manifest(remote: &Path) -> Result<Vec<RemoteNode>, String> {
+pub fn read_remote_manifest(remote: &Path) -> Result<Vec<RemoteNode>, String> {
     let path = remote_manifest_path(remote);
     if !path.exists() {
         return Ok(Vec::new());
@@ -811,7 +1041,7 @@ fn read_remote_manifest(remote: &Path) -> Result<Vec<RemoteNode>, String> {
         .collect()
 }
 
-fn parse_remote_node(line: &str, line_no: usize) -> Result<RemoteNode, String> {
+pub fn parse_remote_node(line: &str, line_no: usize) -> Result<RemoteNode, String> {
     let fields = line.split('\t').collect::<Vec<_>>();
     if fields.len() != 7 {
         return Err(format!("bad manifest line {line_no}"));
@@ -835,7 +1065,7 @@ fn parse_remote_node(line: &str, line_no: usize) -> Result<RemoteNode, String> {
     })
 }
 
-fn write_pulled_index(root: &Path, nodes: &[RemoteNode]) -> Result<(), String> {
+pub fn write_pulled_index(root: &Path, nodes: &[RemoteNode]) -> Result<(), String> {
     init_db(root)?;
     let db = db_path(root);
     let now = now_secs();
@@ -892,12 +1122,27 @@ DELETE FROM repo_status;
     run_sql(&db, &sql)
 }
 
-fn pulled_state(node: &RemoteNode) -> &str {
+pub fn pulled_state(node: &RemoteNode) -> &str {
     match node.kind.as_str() {
         "directory" | "repo" => "local",
         "secret" => "secret-locked",
         _ if node.local_state == "metadata-only" => "metadata-only",
         _ if node.content_hash.is_some() => "remote-only",
         _ => node.local_state.as_str(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_ssh_remote;
+
+    #[test]
+    fn ssh_remote_urls_parse() {
+        let remote = parse_ssh_remote("ssh://user@example.com/backups/devdrop")
+            .unwrap()
+            .unwrap();
+        assert_eq!(remote.host, "user@example.com");
+        assert_eq!(remote.path, "/backups/devdrop");
+        assert!(parse_ssh_remote("/mnt/devdrop").unwrap().is_none());
     }
 }

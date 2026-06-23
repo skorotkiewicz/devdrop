@@ -1,12 +1,12 @@
-use crate::commands::{flag_value, required_arg};
-use crate::db::{db_path, init_db, log_operation, query_lines, run_sql};
-use crate::fs_util::{
+use super::commands::{flag_value, required_arg};
+use super::db::{db_path, init_db, log_operation, query_lines, run_sql};
+use super::fs_util::{
     copy_tree, display_path, find_workspace_root, pin_path, require_dir, sync_tree,
 };
-use crate::git::{git_output, is_repo, repo_status, run_git};
-use crate::index::tree_signature;
-use crate::rules::{Action, Rule};
-use crate::util::{hex_decode_string, json_string, now_nanos, now_secs, sql_string};
+use super::git::{git_output, is_repo, repo_status, run_git};
+use super::index::tree_signature;
+use super::rules::{Action, Rule};
+use super::util::{hex_decode_string, json_string, now_nanos, now_secs, sql_string};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -42,7 +42,7 @@ pub fn cmd_overlay(args: &[String]) -> Result<(), String> {
     }
 }
 
-fn cmd_agent_create(repo: &Path, write_scope: &str, secret_scope: &str) -> Result<(), String> {
+pub fn cmd_agent_create(repo: &Path, write_scope: &str, secret_scope: &str) -> Result<(), String> {
     require_dir(repo)?;
     let root = find_workspace_root(repo)
         .ok_or_else(|| "no workspace found; run `devdrop init <path>`".to_string())?;
@@ -74,7 +74,7 @@ fn cmd_agent_create(repo: &Path, write_scope: &str, secret_scope: &str) -> Resul
     Ok(())
 }
 
-fn ensure_agent_repo_fresh(root: &Path, repo: &Path) -> Result<(), String> {
+pub fn ensure_agent_repo_fresh(root: &Path, repo: &Path) -> Result<(), String> {
     if !is_repo(repo)
         || git_output(
             repo,
@@ -111,7 +111,7 @@ fn ensure_agent_repo_fresh(root: &Path, repo: &Path) -> Result<(), String> {
     ))
 }
 
-fn cmd_agent_status() -> Result<(), String> {
+pub fn cmd_agent_status() -> Result<(), String> {
     let root = env::current_dir()
         .map_err(|err| format!("current dir: {err}"))
         .ok()
@@ -141,7 +141,7 @@ fn cmd_agent_status() -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_agent_diff(id: &str) -> Result<(), String> {
+pub fn cmd_agent_diff(id: &str) -> Result<(), String> {
     let (root, agent) = find_agent(id)?;
     ensure_agent_reviewable(&agent)?;
 
@@ -179,7 +179,7 @@ fn cmd_agent_diff(id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_agent_finish(id: &str, accept: bool) -> Result<(), String> {
+pub fn cmd_agent_finish(id: &str, accept: bool) -> Result<(), String> {
     let (root, agent) = find_agent(id)?;
     ensure_agent_reviewable(&agent)?;
     if accept {
@@ -239,7 +239,7 @@ fn cmd_agent_finish(id: &str, accept: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_overlay_submit(id: Option<&str>) -> Result<(), String> {
+pub fn cmd_overlay_submit(id: Option<&str>) -> Result<(), String> {
     let (root, agent) = find_overlay_agent(id)?;
     if agent.status != "pending" && agent.status != "submitted" {
         return Err(format!("agent {} is {}", agent.id, agent.status));
@@ -274,7 +274,7 @@ pub fn agent_base_path(root: &Path, id: &str) -> PathBuf {
     root.join(".devdrop/agents").join(id).join("base")
 }
 
-fn upsert_agent(
+pub fn upsert_agent(
     root: &Path,
     id: &str,
     repo: &Path,
@@ -300,7 +300,7 @@ fn upsert_agent(
     )
 }
 
-fn update_agent_status(root: &Path, id: &str, status: &str) -> Result<(), String> {
+pub fn update_agent_status(root: &Path, id: &str, status: &str) -> Result<(), String> {
     run_sql(
         &db_path(root),
         &format!(
@@ -312,7 +312,7 @@ fn update_agent_status(root: &Path, id: &str, status: &str) -> Result<(), String
     )
 }
 
-fn list_agents(root: &Path) -> Result<Vec<AgentRow>, String> {
+pub fn list_agents(root: &Path) -> Result<Vec<AgentRow>, String> {
     init_db(root)?;
     query_lines(
         &db_path(root),
@@ -323,7 +323,7 @@ fn list_agents(root: &Path) -> Result<Vec<AgentRow>, String> {
     .collect()
 }
 
-fn parse_agent_row(line: &str) -> Result<AgentRow, String> {
+pub fn parse_agent_row(line: &str) -> Result<AgentRow, String> {
     let fields = line.split('\t').collect::<Vec<_>>();
     if fields.len() != 6 {
         return Err("bad agent row".into());
@@ -338,7 +338,7 @@ fn parse_agent_row(line: &str) -> Result<AgentRow, String> {
     })
 }
 
-fn find_agent(id: &str) -> Result<(PathBuf, AgentRow), String> {
+pub fn find_agent(id: &str) -> Result<(PathBuf, AgentRow), String> {
     let cwd = env::current_dir().map_err(|err| format!("current dir: {err}"))?;
     let root = find_workspace_root(&cwd)
         .ok_or_else(|| "no workspace found; run `devdrop init .`".to_string())?;
@@ -349,7 +349,7 @@ fn find_agent(id: &str) -> Result<(PathBuf, AgentRow), String> {
     Ok((root, agent))
 }
 
-fn find_overlay_agent(id: Option<&str>) -> Result<(PathBuf, AgentRow), String> {
+pub fn find_overlay_agent(id: Option<&str>) -> Result<(PathBuf, AgentRow), String> {
     if let Some(id) = id {
         return find_agent(id);
     }
@@ -377,7 +377,7 @@ fn find_overlay_agent(id: Option<&str>) -> Result<(PathBuf, AgentRow), String> {
     }
 }
 
-fn ensure_agent_reviewable(agent: &AgentRow) -> Result<(), String> {
+pub fn ensure_agent_reviewable(agent: &AgentRow) -> Result<(), String> {
     if agent.status == "pending" || agent.status == "submitted" {
         Ok(())
     } else {
@@ -435,7 +435,10 @@ pub fn agent_stale_paths(root: &Path, agent: &AgentRow) -> Result<Vec<String>, S
         .collect())
 }
 
-fn agent_base_signature(root: &Path, agent: &AgentRow) -> Result<HashMap<String, String>, String> {
+pub fn agent_base_signature(
+    root: &Path,
+    agent: &AgentRow,
+) -> Result<HashMap<String, String>, String> {
     let base = agent_base_path(root, &agent.id);
     if base.is_dir() {
         tree_signature(&base)

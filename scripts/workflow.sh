@@ -1,235 +1,152 @@
-#!/bin/bash
+#!/usr/bin/env -S SHLVL=0 bash
 set -euo pipefail
 
-# devdrop workflow test script
-# End-to-end devdrop workflow smoke
+# End-to-end devdrop workflow smoke test.
+# SSH remote smoke target.
+# DEVDROP_TEST_SSH_REMOTE="${DEVDROP_TEST_SSH_REMOTE:-ssh://mod@ml/home/mod/code/devdrop-workflow-smoke}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEMP_DIR=$(mktemp -d)
 trap "rm -rf $TEMP_DIR" EXIT
 
-# Build devdrop first
 echo "=== Building devdrop ===" >&2
-cargo build --release --manifest-path "$REPO_ROOT/Cargo.toml" 2>/dev/null
+cargo build --release --manifest-path "$REPO_ROOT/Cargo.toml" >/dev/null
 
 DEVDROP="$REPO_ROOT/target/release/devdrop"
-
-# Setup test workspace
 TEST_WS="$TEMP_DIR/workspace"
-TEST_REMOTE="$TEMP_DIR/remote"
-mkdir -p "$TEST_WS" "$TEST_REMOTE"
-
-echo "=== Test 1: Workspace initialization ===" >&2
-$DEVDROP workspace init "$TEST_WS"
-test -d "$TEST_WS/.devdrop" && echo "PASS: .devdrop directory created" || echo "FAIL"
-
-echo "=== Test 2: Login ===" >&2
-cd "$TEST_WS"
-$DEVDROP login testuser
-test -f "$TEST_WS/.devdrop/devdrop.sqlite" && echo "PASS: Database created" || echo "FAIL"
-
-echo "=== Test 3: Device enrollment ===" >&2
-$DEVDROP device enroll "test-device"
-echo "PASS: Device enrolled"
-
-echo "=== Test 4: Sync empty workspace ===" >&2
-$DEVDROP sync "$TEST_WS" --remote "$TEST_REMOTE"
-echo "PASS: Empty sync completed"
-
-echo "=== Test 5: Status on empty workspace ===" >&2
-$DEVDROP status "$TEST_WS"
-echo "PASS: Status works"
-
-echo "=== Test 6: Create files and sync ===" >&2
-mkdir -p "$TEST_WS/project/src"
-echo "fn main() {}" > "$TEST_WS/project/src/main.rs"
-echo "# Project" > "$TEST_WS/project/README.md"
-cd "$TEST_WS"
-$DEVDROP sync "$TEST_WS" --remote "$TEST_REMOTE"
-echo "PASS: File sync completed"
-
-echo "=== Test 7: List workspace contents ===" >&2
-$DEVDROP ls "$TEST_WS"
-echo "PASS: ls works"
-
-echo "=== Test 8: Create git repo and check status ===" >&2
-cd "$TEST_WS/project"
-git init
-git config user.email "test@test.com"
-git config user.name "Test"
-git config commit.gpgsign false
-git add .
-git commit -m "init"
-cd "$TEST_WS"
-$DEVDROP repo-status "$TEST_WS"
-echo "PASS: repo-status works"
-
-echo "=== Test 9: Check ignored patterns ===" >&2
-mkdir -p "$TEST_WS/project/target"
-echo "binary" > "$TEST_WS/project/target/output"
-$DEVDROP ignored "$TEST_WS/project"
-echo "PASS: ignored works"
-
-echo "=== Test 10: Pin a file ===" >&2
-$DEVDROP pin "$TEST_WS/project/README.md"
-test -f "$TEST_WS/.devdrop/pins" && echo "PASS: Pin file created" || echo "FAIL"
-
-echo "=== Test 11: Remote sync cycle ===" >&2
-# Create a second workspace to test remote sync
 TEST_WS2="$TEMP_DIR/workspace2"
-mkdir -p "$TEST_WS2"
-$DEVDROP workspace init "$TEST_WS2"
-cd "$TEST_WS2"
-$DEVDROP sync "$TEST_WS2" --remote "$TEST_REMOTE" --pull
-$DEVDROP ls "$TEST_WS2"
-echo "PASS: Remote pull works"
-
-echo "=== Test 11b: Device state syncs between workspaces ===" >&2
-$DEVDROP device list | grep -q "test-device"
-$DEVDROP login testuser
-$DEVDROP device enroll "second-device"
-$DEVDROP sync "$TEST_WS2" --remote "$TEST_REMOTE"
-
-echo "=== Test 11c: Unhydrated push preserves remote namespace ===" >&2
 TEST_WS3="$TEMP_DIR/workspace3"
-mkdir -p "$TEST_WS3"
-$DEVDROP workspace init "$TEST_WS3"
-cd "$TEST_WS3"
-$DEVDROP sync "$TEST_WS3" --remote "$TEST_REMOTE" --pull
-$DEVDROP ls "$TEST_WS3/project/src" | grep -q "main.rs"
-$DEVDROP pin "$TEST_WS3/project/src"
-$DEVDROP sync "$TEST_WS3" --remote "$TEST_REMOTE" --pull
-grep -q "fn main" "$TEST_WS3/project/src/main.rs"
-echo "PASS: Unhydrated push preserves remote namespace and pins hydrate"
+TEST_REMOTE="$TEMP_DIR/remote"
+mkdir -p "$TEST_WS" "$TEST_WS2" "$TEST_WS3" "$TEST_REMOTE"
 
-cd "$TEST_WS"
-$DEVDROP sync "$TEST_WS" --remote "$TEST_REMOTE" --pull
-$DEVDROP device list | grep -q "second-device"
-echo "PASS: Device state syncs"
+echo "=== Test 1: init --remote writes .devdrop.toml ===" >&2
+"$DEVDROP" init "$TEST_WS" --remote "$TEST_REMOTE"
+test -d "$TEST_WS/.devdrop"
+test -f "$TEST_WS/.devdrop.toml"
+grep -q "$TEST_REMOTE" "$TEST_WS/.devdrop.toml"
+(cd "$TEST_WS" && "$DEVDROP" remote ls | grep -q "$TEST_REMOTE")
+(cd "$TEST_WS" && test "$("$DEVDROP" config get remote.url)" = "$TEST_REMOTE")
+echo "PASS: init --remote creates workspace config"
 
-echo "=== Test 11d: Pull conflict keeps local and remote edits ===" >&2
-echo "remote edit" > "$TEST_WS/project/README.md"
-cd "$TEST_WS"
-$DEVDROP sync "$TEST_WS" --remote "$TEST_REMOTE"
-echo "local edit" > "$TEST_WS2/project/README.md"
-cd "$TEST_WS2"
-$DEVDROP sync "$TEST_WS2" --remote "$TEST_REMOTE" --pull
-test "$(cat "$TEST_WS2/project/README.md")" = "local edit"
-CONFLICT_FILE=$(find "$TEST_WS2/project" -name 'README (conflict from remote *).md' -print -quit)
+echo "=== Test 2: plain sync uses configured remote ===" >&2
+mkdir -p "$TEST_WS/project/src"
+printf 'fn main() {}\n' > "$TEST_WS/project/src/main.rs"
+printf '# Project\n' > "$TEST_WS/project/README.md"
+(cd "$TEST_WS" && "$DEVDROP" sync)
+test -f "$TEST_REMOTE/manifests/latest.tsv"
+test -d "$TEST_REMOTE/objects"
+echo "PASS: sync pushed manifest and objects"
+
+echo "=== Test 3: second workspace plain sync pulls and hydrates ===" >&2
+"$DEVDROP" init "$TEST_WS2" --remote "$TEST_REMOTE"
+(cd "$TEST_WS2" && "$DEVDROP" sync)
+grep -q "fn main" "$TEST_WS2/project/src/main.rs"
+grep -q "# Project" "$TEST_WS2/project/README.md"
+echo "PASS: plain sync pulls and hydrates files"
+
+echo "=== Test 4: normal remote edit updates local without conflict ===" >&2
+printf 'from workspace2\n' > "$TEST_WS2/project/README.md"
+(cd "$TEST_WS2" && "$DEVDROP" sync)
+(cd "$TEST_WS" && "$DEVDROP" sync)
+test "$(cat "$TEST_WS/project/README.md")" = "from workspace2"
+test -z "$(find "$TEST_WS/project" -name '*conflict*' -print -quit)"
+echo "PASS: remote edit updates clean local file"
+
+echo "=== Test 5: divergent edits create one conflict sibling ===" >&2
+printf 'local divergence\n' > "$TEST_WS/project/README.md"
+printf 'remote divergence\n' > "$TEST_WS2/project/README.md"
+(cd "$TEST_WS2" && "$DEVDROP" sync)
+(cd "$TEST_WS" && "$DEVDROP" sync)
+test "$(cat "$TEST_WS/project/README.md")" = "local divergence"
+CONFLICT_FILE=$(find "$TEST_WS/project" -name 'README.conflict-remote-*.md' -print -quit)
 test -n "$CONFLICT_FILE"
-test "$(cat "$CONFLICT_FILE")" = "remote edit"
-$DEVDROP conflicts "$TEST_WS2" | grep -q "README"
-echo "PASS: Pull conflict keeps both versions"
+test "$(cat "$CONFLICT_FILE")" = "remote divergence"
+"$DEVDROP" conflicts "$TEST_WS" | grep -q "README.conflict-remote"
+"$DEVDROP" conflicts resolve "$CONFLICT_FILE" --use conflict
+test "$(cat "$TEST_WS/project/README.md")" = "remote divergence"
+echo "PASS: divergent edits conflict and resolve"
 
-echo "=== Test 11e: Pull conflict resolves to remote copy ===" >&2
-$DEVDROP conflicts resolve "$CONFLICT_FILE" --use conflict
-test "$(cat "$TEST_WS2/project/README.md")" = "remote edit"
-echo "PASS: Pull conflict resolves"
-
-echo "=== Test 11f: Remote delete conflict keeps local edit ===" >&2
-echo "local delete-conflict edit" > "$TEST_WS2/project/README.md"
-rm "$TEST_WS/project/README.md"
-cd "$TEST_WS"
-$DEVDROP sync "$TEST_WS" --remote "$TEST_REMOTE"
-cd "$TEST_WS2"
-$DEVDROP sync "$TEST_WS2" --remote "$TEST_REMOTE" --pull
-test ! -e "$TEST_WS2/project/README.md"
-DELETE_CONFLICT=$(find "$TEST_WS2/project" -name 'README (conflict from local *).md' -print -quit)
+echo "=== Test 6: remote delete conflict preserves local edit ===" >&2
+printf 'common delete file\n' > "$TEST_WS/project/delete-me.txt"
+(cd "$TEST_WS" && "$DEVDROP" sync)
+(cd "$TEST_WS2" && "$DEVDROP" sync)
+printf 'local delete-conflict edit\n' > "$TEST_WS2/project/delete-me.txt"
+rm "$TEST_WS/project/delete-me.txt"
+(cd "$TEST_WS" && "$DEVDROP" sync)
+(cd "$TEST_WS2" && "$DEVDROP" sync)
+test ! -e "$TEST_WS2/project/delete-me.txt"
+DELETE_CONFLICT=$(find "$TEST_WS2/project" -name 'delete-me.conflict-local-*.txt' -print -quit)
 test -n "$DELETE_CONFLICT"
 test "$(cat "$DELETE_CONFLICT")" = "local delete-conflict edit"
-$DEVDROP conflicts "$TEST_WS2" | grep -q "conflict from local"
-echo "PASS: Remote delete conflict keeps local edit"
+"$DEVDROP" conflicts resolve "$DELETE_CONFLICT" --use conflict
+test "$(cat "$TEST_WS2/project/delete-me.txt")" = "local delete-conflict edit"
+echo "PASS: delete conflict preserves and resolves local edit"
 
-echo "=== Test 11g: Delete conflict resolves to local copy ===" >&2
-$DEVDROP conflicts resolve "$DELETE_CONFLICT" --use conflict
-test "$(cat "$TEST_WS2/project/README.md")" = "local delete-conflict edit"
-echo "PASS: Delete conflict resolves"
+echo "=== Test 7: config pins are read from .devdrop.toml ===" >&2
+(cd "$TEST_WS" && "$DEVDROP" config set pins project/src)
+(cd "$TEST_WS" && test "$("$DEVDROP" config get pins)" = "project/src")
+grep -q 'pins = \["project/src"\]' "$TEST_WS/.devdrop.toml"
+echo "PASS: config pins round-trip"
 
-echo "=== Test 12: Secrets (requires openssl) ===" >&2
-if command -v openssl &>/dev/null; then
-    export DEVDROP_SECRET_KEY="test-secret-key-12345"
-    echo "API_KEY=secret123" > "$TEST_WS/project/.env"
-    $DEVDROP secret add "$TEST_WS/project/.env" --scope dev
-    # secret add encrypts to vault; secret lock removes plaintext
-    $DEVDROP secret lock "$TEST_WS/project/.env" --scope dev
-    test ! -e "$TEST_WS/project/.env" && echo "PASS: Secret locked (file removed)" || echo "FAIL"
-    $DEVDROP secret unlock "$TEST_WS/project/.env" --scope dev
-    test -s "$TEST_WS/project/.env" && echo "PASS: Secret unlocked" || echo "FAIL"
-    echo "PASS: Secret lock/unlock works"
+echo "=== Test 8: remote add writes configured remote ===" >&2
+"$DEVDROP" init "$TEST_WS3"
+(cd "$TEST_WS3" && "$DEVDROP" remote add "$TEST_REMOTE")
+(cd "$TEST_WS3" && "$DEVDROP" remote ls | grep -q "$TEST_REMOTE")
+(cd "$TEST_WS3" && "$DEVDROP" sync)
+echo "PASS: remote add makes sync work without --remote"
+
+echo "=== Test 9: secret set works without DEVDROP_SECRET_KEY ===" >&2
+(cd "$TEST_WS" && env -u DEVDROP_SECRET_KEY "$DEVDROP" secret set API_KEY=secret123)
+(cd "$TEST_WS" && env -u DEVDROP_SECRET_KEY "$DEVDROP" secret list | grep -q API_KEY)
+SECRET_VALUE=$(cd "$TEST_WS" && env -u DEVDROP_SECRET_KEY "$DEVDROP" run --repo "$TEST_WS" -- printenv API_KEY)
+test "$SECRET_VALUE" = "secret123"
+test -f "$TEST_WS/.devdrop/secret.key"
+echo "PASS: secret set stores and injects env value"
+
+echo "=== Test 10: edit wraps overlay review ===" >&2
+EDIT_OUTPUT=$(cd "$TEST_WS" && printf 'n\n' | EDITOR=true "$DEVDROP" edit "$TEST_WS/project")
+grep -q "Editing overlay:" <<<"$EDIT_OUTPUT"
+grep -q "Changes rejected" <<<"$EDIT_OUTPUT"
+echo "PASS: edit opens overlay and prompts accept/reject"
+
+echo "=== Test 11: repo status and ignored files still work ===" >&2
+if command -v git >/dev/null 2>&1; then
+    cd "$TEST_WS/project"
+    git init >/dev/null
+    git config user.email "test@test.com"
+    git config user.name "Test"
+    git config commit.gpgsign false
+    git add .
+    git commit -m "init" >/dev/null
+    mkdir -p "$TEST_WS/project/target"
+    printf 'binary\n' > "$TEST_WS/project/target/output"
+    "$DEVDROP" repo-status "$TEST_WS" >/dev/null
+    "$DEVDROP" ignored "$TEST_WS/project" | grep -q "target"
+    echo "PASS: repo-status and ignored work"
 else
-    echo "SKIP: openssl not available"
+    echo "SKIP: git not available"
 fi
 
-echo "=== Test 13: Stale repo blocks agent start ===" >&2
-TEST_UPSTREAM="$TEMP_DIR/upstream.git"
-TEST_SEED="$TEMP_DIR/upstream-seed"
-git init --bare "$TEST_UPSTREAM"
-git clone "$TEST_UPSTREAM" "$TEST_SEED"
-cd "$TEST_SEED"
-git config user.email "test@test.com"
-git config user.name "Test"
-git config commit.gpgsign false
-echo "one" > app.txt
-git add app.txt
-git commit -m "one"
-git branch -M main
-git push -u origin main
-git clone "$TEST_UPSTREAM" "$TEST_WS/stale-agent-repo"
-cd "$TEST_WS/stale-agent-repo"
-git config user.email "test@test.com"
-git config user.name "Test"
-git config commit.gpgsign false
-cd "$TEST_SEED"
-echo "two" >> app.txt
-git commit -am "two"
-git push
-cd "$TEST_WS"
-if $DEVDROP agent create --repo "$TEST_WS/stale-agent-repo" --write-scope "**" --secret-scope ""; then
-    echo "FAIL: stale repo should block agent start"
-    exit 1
+echo "=== Test 12: history, status, doctor ===" >&2
+printf 'updated content\n' >> "$TEST_WS/project/README.md"
+(cd "$TEST_WS" && "$DEVDROP" sync)
+"$DEVDROP" history "$TEST_WS/project/README.md" | grep -q "fnv1a64"
+"$DEVDROP" status "$TEST_WS" >/dev/null
+"$DEVDROP" doctor "$TEST_WS" >/dev/null
+echo "PASS: history, status, and doctor run"
+
+if [[ -n "${DEVDROP_TEST_SSH_REMOTE:-}" ]]; then
+    echo "=== Test 13: SSH remote backend ===" >&2
+    SSH_WS="$TEMP_DIR/ssh-workspace"
+    mkdir -p "$SSH_WS"
+    printf 'ssh smoke\n' > "$SSH_WS/file.txt"
+    "$DEVDROP" init "$SSH_WS" --remote "$DEVDROP_TEST_SSH_REMOTE"
+    (cd "$SSH_WS" && "$DEVDROP" sync)
+    echo "PASS: SSH remote sync completed"
+else
+    echo "SKIP: set DEVDROP_TEST_SSH_REMOTE=ssh://host/path to test SSH remote"
 fi
-$DEVDROP repo update "$TEST_WS/stale-agent-repo"
-$DEVDROP agent create --repo "$TEST_WS/stale-agent-repo" --write-scope "**" --secret-scope "" >/dev/null
-echo "PASS: Stale repo blocks agent start"
-
-echo "=== Test 14: Agent workflow ===" >&2
-AGENT_ID=$($DEVDROP agent create --repo "$TEST_WS/project" --write-scope "src/**" --secret-scope "" | head -1 | awk '{print $3}')
-echo "PASS: Agent created: $AGENT_ID"
-
-echo "=== Test 14b: Agent diff (show changes) ===" >&2
-# Modify a file in the overlay
-echo "fn main() { println!(); }" > "$TEST_WS/.devdrop/agents/$AGENT_ID/overlay/src/main.rs"
-cd "$TEST_WS"
-$DEVDROP agent diff "$AGENT_ID"
-echo "PASS: Agent diff shows changes"
-
-echo "=== Test 14c: Agent accept (apply overlay) ===" >&2
-$DEVDROP agent accept "$AGENT_ID"
-echo "PASS: Agent changes accepted"
-
-echo "=== Test 14d: Stale agent accept is blocked ===" >&2
-STALE_AGENT_ID=$($DEVDROP agent create --repo "$TEST_WS/project" --write-scope "src/**" --secret-scope "" | head -1 | awk '{print $3}')
-echo "agent" > "$TEST_WS/.devdrop/agents/$STALE_AGENT_ID/overlay/src/stale.rs"
-echo "user" > "$TEST_WS/project/src/stale.rs"
-cd "$TEST_WS"
-$DEVDROP overlay submit "$STALE_AGENT_ID"
-if $DEVDROP agent accept "$STALE_AGENT_ID"; then
-    echo "FAIL: stale agent accept should fail"
-    exit 1
-fi
-test "$(cat "$TEST_WS/project/src/stale.rs")" = "user" && echo "PASS: Stale agent accept blocked" || echo "FAIL"
-
-echo "=== Test 15: Doctor check ===" >&2
-$DEVDROP doctor "$TEST_WS"
-echo "PASS: doctor runs"
-
-echo "=== Test 16: History tracking ===" >&2
-echo "updated content" >> "$TEST_WS/project/README.md"
-cd "$TEST_WS"
-$DEVDROP sync "$TEST_WS" --remote "$TEST_REMOTE"
-$DEVDROP history "$TEST_WS/project/README.md"
-echo "PASS: History tracked"
 
 echo "" >&2
 echo "=== All tests passed ===" >&2

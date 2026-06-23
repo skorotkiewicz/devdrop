@@ -1,4 +1,4 @@
-use crate::fs_util::display_path;
+use super::fs_util::display_path;
 use std::fs;
 use std::path::Path;
 
@@ -13,7 +13,7 @@ pub enum Action {
 }
 
 impl Action {
-    fn from_token(token: &str) -> Option<Self> {
+    pub fn from_token(token: &str) -> Option<Self> {
         match token {
             "sync" => Some(Self::Sync),
             "ignore" => Some(Self::Ignore),
@@ -72,7 +72,7 @@ impl Rule {
         }
     }
 
-    fn parse(line: &str) -> Option<Self> {
+    pub fn parse(line: &str) -> Option<Self> {
         let line = line.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
             return None;
@@ -113,7 +113,7 @@ impl Rule {
         }
     }
 
-    fn matches_directory(&self, rel: &str, is_dir: bool) -> bool {
+    pub fn matches_directory(&self, rel: &str, is_dir: bool) -> bool {
         if self.pattern.contains('/') {
             return rel == self.pattern
                 || rel

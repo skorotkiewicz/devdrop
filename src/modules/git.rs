@@ -1,8 +1,8 @@
-use crate::commands::{first_positional, optional_path};
-use crate::fs_util::{display_path, require_dir};
-use crate::index::walk_dirs;
-use crate::rules::Rules;
-use crate::util::{json_optional, json_string};
+use super::commands::{first_positional, optional_path};
+use super::fs_util::{display_path, require_dir};
+use super::index::walk_dirs;
+use super::rules::Rules;
+use super::util::{json_optional, json_string};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -76,7 +76,7 @@ pub fn cmd_repo_status(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn find_repos(root: &Path, rules: &Rules) -> Result<Vec<PathBuf>, String> {
+pub fn find_repos(root: &Path, rules: &Rules) -> Result<Vec<PathBuf>, String> {
     let mut repos = Vec::new();
 
     if is_repo(root) {
@@ -158,7 +158,7 @@ pub fn stale_repo_warning(path: &Path, status: &RepoStatus) -> Option<String> {
     })
 }
 
-fn print_repo_status_json(path: &Path, status: &RepoStatus) {
+pub fn print_repo_status_json(path: &Path, status: &RepoStatus) {
     print!(
         "{{\"path\":{},\"remote\":{},\"branch\":{},\"head\":{},\"upstream\":{},\"ahead\":{},\"behind\":{},\"dirty\":{}}}",
         json_string(&display_path(path)),

@@ -1,25 +1,25 @@
-use crate::agent::{
+use super::agent::{
     AgentRow, agent_base_path, agent_scope_violations, agent_stale_paths, write_scope_allows,
 };
-use crate::fs_util::copy_tree;
-use crate::git::{RepoStatus, stale_repo_warning};
-use crate::index::is_conflict_path;
-use crate::remote::conflict_base_path;
-use crate::rules::{Action, Rule, Rules, default_rules, wildcard_match};
-use crate::secrets::parse_env;
-use crate::util::{now_nanos, sql_string};
+use super::fs_util::copy_tree;
+use super::git::{RepoStatus, stale_repo_warning};
+use super::index::is_conflict_path;
+use super::remote::conflict_base_path;
+use super::rules::{Action, Rule, Rules, default_rules, wildcard_match};
+use super::secrets::parse_env;
+use super::util::{now_nanos, sql_string};
 use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 #[test]
-fn wildcard_matches_suffixes() {
+pub fn wildcard_matches_suffixes() {
     assert!(wildcard_match("*.pyc", "thing.pyc"));
     assert!(wildcard_match(".env.*", ".env.local"));
     assert!(!wildcard_match("*.pyc", "thing.py"));
 }
 
 #[test]
-fn default_rules_keep_env_example_syncable() {
+pub fn default_rules_keep_env_example_syncable() {
     let rules = Rules {
         rules: default_rules(),
         default_count: 0,
@@ -32,7 +32,7 @@ fn default_rules_keep_env_example_syncable() {
 }
 
 #[test]
-fn directory_rules_match_nested_components() {
+pub fn directory_rules_match_nested_components() {
     let rule = Rule::new("node_modules/", Action::MetadataOnly);
 
     assert!(rule.matches("work/api/node_modules", true));
@@ -41,7 +41,7 @@ fn directory_rules_match_nested_components() {
 }
 
 #[test]
-fn later_rules_override_earlier_rules() {
+pub fn later_rules_override_earlier_rules() {
     let rules = Rules {
         rules: vec![
             Rule::new("dist/", Action::Ignore),
@@ -55,7 +55,8 @@ fn later_rules_override_earlier_rules() {
 }
 
 #[test]
-fn conflict_names_are_detected() {
+pub fn conflict_names_are_detected() {
+    assert!(is_conflict_path("src/config.conflict-remote-123.ts"));
     assert!(is_conflict_path(
         "src/config (conflict from Mac Mini 2026-06-23 10-41).ts"
     ));
@@ -63,7 +64,11 @@ fn conflict_names_are_detected() {
 }
 
 #[test]
-fn conflict_base_path_removes_marker() {
+pub fn conflict_base_path_removes_marker() {
+    assert_eq!(
+        conflict_base_path(Path::new("src/config.conflict-remote-123.ts")).unwrap(),
+        PathBuf::from("src/config.ts")
+    );
     assert_eq!(
         conflict_base_path(Path::new(
             "src/config (conflict from Mac Mini 2026-06-23 10-41).ts"
@@ -74,12 +79,12 @@ fn conflict_base_path_removes_marker() {
 }
 
 #[test]
-fn sql_strings_escape_quotes() {
+pub fn sql_strings_escape_quotes() {
     assert_eq!(sql_string("it's fine"), "'it''s fine'");
 }
 
 #[test]
-fn env_parser_handles_comments_exports_and_quotes() {
+pub fn env_parser_handles_comments_exports_and_quotes() {
     let envs = parse_env(
         r#"
 # comment
@@ -99,7 +104,7 @@ PLAIN=value
 }
 
 #[test]
-fn stale_repo_warning_mentions_upstream() {
+pub fn stale_repo_warning_mentions_upstream() {
     let status = RepoStatus {
         remote_url: None,
         branch: Some("main".into()),
@@ -115,14 +120,14 @@ fn stale_repo_warning_mentions_upstream() {
 }
 
 #[test]
-fn write_scope_double_star_includes_root_directory() {
+pub fn write_scope_double_star_includes_root_directory() {
     assert!(write_scope_allows("src/**", "src", true));
     assert!(write_scope_allows("src/**", "src/lib.rs", false));
     assert!(!write_scope_allows("src/**", "tests/lib.rs", false));
 }
 
 #[test]
-fn agent_scope_violations_report_out_of_scope_changes() {
+pub fn agent_scope_violations_report_out_of_scope_changes() {
     let root = env::temp_dir().join(format!("devdrop-test-{}", now_nanos()));
     let repo = root.join("repo");
     let overlay = root.join("overlay");
@@ -152,7 +157,7 @@ fn agent_scope_violations_report_out_of_scope_changes() {
 }
 
 #[test]
-fn agent_stale_paths_report_live_repo_changes() {
+pub fn agent_stale_paths_report_live_repo_changes() {
     let root = env::temp_dir().join(format!("devdrop-test-{}", now_nanos()));
     let repo = root.join("repo");
     let overlay = root.join("overlay");

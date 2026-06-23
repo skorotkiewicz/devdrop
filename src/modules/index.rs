@@ -1,15 +1,14 @@
-use crate::db::{db_path, init_db, log_operation, operation_sql, query_lines, query_one, run_sql};
-use crate::fs_util::{
+use super::db::{db_path, init_db, log_operation, operation_sql, query_lines, query_one, run_sql};
+use super::fs_util::{
     display_path, find_workspace_root, pin_path, rel_or_dot, rel_path, require_dir,
     skip_overlay_component,
 };
-use crate::git::{RepoStatus, is_repo, repo_dirty, repo_status};
-use crate::remote::fetch_remote_object;
-use crate::rules::{Action, Rules};
-use crate::util::{fnv_bytes, hex_decode_string, now_secs, sql_optional, sql_string};
+use super::git::{RepoStatus, is_repo, repo_dirty, repo_status};
+use super::remote::fetch_remote_object;
+use super::rules::{Action, Rules};
+use super::util::{fnv_bytes, hex_decode_string, now_secs, sql_optional, sql_string};
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
-use std::io::Read;
+use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -26,7 +25,7 @@ pub fn tree_signature(root: &Path) -> Result<HashMap<String, String>, String> {
     Ok(signature)
 }
 
-fn collect_tree_signature(
+pub fn collect_tree_signature(
     root: &Path,
     current: &Path,
     signature: &mut HashMap<String, String>,
@@ -158,7 +157,7 @@ pub fn indexed_entries_in_dir(dir: &Path) -> Result<Vec<IndexedEntry>, String> {
     Ok(entries)
 }
 
-fn indexed_entry_from_row(row: &str, dir_rel: &str) -> Result<Option<IndexedEntry>, String> {
+pub fn indexed_entry_from_row(row: &str, dir_rel: &str) -> Result<Option<IndexedEntry>, String> {
     let fields = row.split('\t').collect::<Vec<_>>();
     if fields.len() != 3 {
         return Ok(None);
@@ -223,9 +222,9 @@ pub struct BlobRow {
     pub ref_count: usize,
 }
 
-struct PreviousFile {
-    path: String,
-    content_hash: String,
+pub struct PreviousFile {
+    pub path: String,
+    pub content_hash: String,
 }
 
 pub struct FileVersion {
@@ -317,7 +316,7 @@ pub fn collect_index(root: &Path, rules: &Rules) -> Result<IndexSnapshot, String
     })
 }
 
-fn push_index_node(
+pub fn push_index_node(
     root: &Path,
     path: &Path,
     rel: &str,
@@ -412,7 +411,7 @@ pub fn carry_indexed_remote_nodes(root: &Path, snapshot: &mut IndexSnapshot) -> 
     Ok(())
 }
 
-fn previous_index_files(root: &Path) -> Result<Vec<PreviousFile>, String> {
+pub fn previous_index_files(root: &Path) -> Result<Vec<PreviousFile>, String> {
     let db = db_path(root);
     if !db.exists() {
         return Ok(Vec::new());
@@ -506,9 +505,9 @@ pub fn local_state_for(rel: &str, action: Action) -> &'static str {
 }
 
 pub fn is_conflict_path(rel: &str) -> bool {
-    rel.rsplit('/')
-        .next()
-        .is_some_and(|name| name.contains(" (conflict from ") && name.contains(')'))
+    rel.rsplit('/').next().is_some_and(|name| {
+        name.contains(".conflict-") || (name.contains(" (conflict from ") && name.contains(')'))
+    })
 }
 
 pub fn write_index(root: &Path, rules: &Rules, snapshot: &IndexSnapshot) -> Result<(), String> {
@@ -648,7 +647,7 @@ where
     Ok(())
 }
 
-fn node_kind(path: &Path, action: Action, metadata: &fs::Metadata) -> String {
+pub fn node_kind(path: &Path, action: Action, metadata: &fs::Metadata) -> String {
     if matches!(action, Action::Secret) {
         "secret"
     } else if metadata.is_dir() && is_repo(path) {
@@ -664,12 +663,12 @@ fn node_kind(path: &Path, action: Action, metadata: &fs::Metadata) -> String {
 }
 
 #[cfg(unix)]
-fn file_mode(metadata: &fs::Metadata) -> u32 {
+pub fn file_mode(metadata: &fs::Metadata) -> u32 {
     metadata.permissions().mode()
 }
 
 #[cfg(not(unix))]
-fn file_mode(metadata: &fs::Metadata) -> u32 {
+pub fn file_mode(metadata: &fs::Metadata) -> u32 {
     if metadata.permissions().readonly() {
         0o444
     } else {
@@ -677,7 +676,7 @@ fn file_mode(metadata: &fs::Metadata) -> u32 {
     }
 }
 
-fn modified_secs(metadata: &fs::Metadata) -> i64 {
+pub fn modified_secs(metadata: &fs::Metadata) -> i64 {
     metadata
         .modified()
         .ok()

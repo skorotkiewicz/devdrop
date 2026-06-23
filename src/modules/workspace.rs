@@ -1,32 +1,35 @@
-use crate::commands::{first_positional, flag_value, optional_path, required_arg, required_path};
-use crate::crypto::command_ok;
-use crate::db::{
+use super::agent::{agent_base_path, agent_overlay_path, update_agent_status, upsert_agent};
+use super::commands::{first_positional, flag_value, optional_path, required_arg, required_path};
+use super::crypto::command_ok;
+use super::db::{
     current_user, db_path, device_count, init_db, log_operation, query_lines, run_sql, upsert_user,
 };
-use crate::fs_util::{
-    display_path, find_workspace_root, pin_path, read_pins, rel_path, require_dir, write_pins,
+use super::fs_util::{
+    copy_tree, display_path, find_workspace_root, pin_path, read_pins, rel_path, require_dir,
+    sync_tree, write_pins,
 };
-use crate::git::is_repo;
-use crate::index::{
+use super::git::is_repo;
+use super::index::{
     Counts, file_versions, hydrate_from_local_store, indexed_entries_in_dir, indexed_state_count,
     latest_file_version_hash, local_state_for, object_path, object_store_path, scan_workspace,
     walk_dirs,
 };
-use crate::remote::{fetch_remote_object, read_remote_config, write_remote_config};
-use crate::rules::{Action, Rules};
-use crate::secrets::{locked_secret_count, locked_secrets_in_dir, secret_store_path};
-use crate::util::{
+use super::remote::{fetch_remote_object, read_remote_config, write_remote_url};
+use super::rules::{Action, Rules};
+use super::secrets::{locked_secret_count, locked_secrets_in_dir, secret_store_path};
+use super::util::{
     current_arch, current_os, fnv_bytes, json_string, now_nanos, now_secs, sql_string,
 };
 use std::collections::HashSet;
 use std::env;
 use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub fn cmd_init(args: &[String]) -> Result<(), String> {
     let root = optional_path(first_positional(args))?;
     let user = default_user();
-    let remote = flag_value(args, "--remote").map(PathBuf::from);
+    let remote = flag_value(args, "--remote").map(str::to_string);
 
     init_workspace_storage(&root)?;
     upsert_user(&root, &user)?;
@@ -39,7 +42,7 @@ pub fn cmd_init(args: &[String]) -> Result<(), String> {
     };
 
     if let Some(remote) = &remote {
-        write_remote_config(&root, remote)?;
+        write_remote_url(&root, remote)?;
     }
 
     log_operation(
@@ -58,7 +61,7 @@ pub fn cmd_init(args: &[String]) -> Result<(), String> {
         "remote: {}",
         remote
             .as_ref()
-            .map(|path| display_path(path))
+            .cloned()
             .unwrap_or_else(|| "not configured".to_string())
     );
     println!("next: devdrop sync {}", display_path(&root));
@@ -111,7 +114,7 @@ pub fn cmd_device(args: &[String]) -> Result<(), String> {
     }
 }
 
-fn cmd_device_enroll(name: &str) -> Result<(), String> {
+pub fn cmd_device_enroll(name: &str) -> Result<(), String> {
     let root = env::current_dir()
         .map_err(|err| format!("current dir: {err}"))
         .ok()
@@ -132,7 +135,7 @@ fn cmd_device_enroll(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_device_list() -> Result<(), String> {
+pub fn cmd_device_list() -> Result<(), String> {
     let root = env::current_dir()
         .map_err(|err| format!("current dir: {err}"))
         .ok()
@@ -160,13 +163,13 @@ fn cmd_device_list() -> Result<(), String> {
     Ok(())
 }
 
-fn default_user() -> String {
+pub fn default_user() -> String {
     env::var("USER")
         .or_else(|_| env::var("USERNAME"))
         .unwrap_or_else(|_| "local".to_string())
 }
 
-fn default_device_name() -> String {
+pub fn default_device_name() -> String {
     env::var("HOSTNAME")
         .or_else(|_| env::var("COMPUTERNAME"))
         .ok()
@@ -174,7 +177,7 @@ fn default_device_name() -> String {
         .unwrap_or_else(|| "local-device".to_string())
 }
 
-fn upsert_device(root: &Path, user: &str, name: &str) -> Result<String, String> {
+pub fn upsert_device(root: &Path, user: &str, name: &str) -> Result<String, String> {
     let id = format!(
         "device_{:016x}",
         fnv_bytes(format!("{user}:{name}").as_bytes())
@@ -254,7 +257,7 @@ pub fn cmd_status(args: &[String]) -> Result<(), String> {
         "remote: {}",
         remote
             .as_ref()
-            .map(|path| display_path(path))
+            .cloned()
             .unwrap_or_else(|| "not configured".to_string())
     );
     println!(
@@ -264,7 +267,7 @@ pub fn cmd_status(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn status_next(root: &Path, counts: &Counts, index: &str, remote: Option<&Path>) -> String {
+pub fn status_next(root: &Path, counts: &Counts, index: &str, remote: Option<&str>) -> String {
     let root = display_path(root);
     if index == "missing" {
         return format!("devdrop init {root}");
@@ -410,7 +413,7 @@ pub fn cmd_doctor(root: PathBuf) -> Result<(), String> {
         "remote manifest: {}",
         remote
             .as_ref()
-            .map(|path| format!("configured {}", display_path(path)))
+            .map(|url| format!("configured {url}"))
             .unwrap_or_else(|| "not configured".to_string())
     );
     println!(
@@ -507,6 +510,65 @@ pub fn cmd_pin(path: PathBuf, pin: bool) -> Result<(), String> {
         println!("unpinned: {rel}");
     }
 
+    Ok(())
+}
+
+pub fn cmd_edit(path: PathBuf) -> Result<(), String> {
+    let root = find_workspace_root(&path)
+        .ok_or_else(|| "no workspace found; run `devdrop init <path>`".to_string())?;
+    let repo = if path.is_dir() {
+        path
+    } else {
+        path.parent().unwrap().to_path_buf()
+    };
+
+    // Create agent overlay
+    let id = format!("edit_{}", now_nanos());
+    let overlay = agent_overlay_path(&root, &id);
+    let base = agent_base_path(&root, &id);
+    copy_tree(&repo, &base)?;
+    copy_tree(&base, &overlay)?;
+    upsert_agent(&root, &id, &repo, &overlay, "**", "", "pending")?;
+
+    println!("Editing overlay: {}", display_path(&overlay));
+    println!("Base: {}", display_path(&repo));
+
+    // Open in $EDITOR
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+    let status = std::process::Command::new(&editor)
+        .arg(&overlay)
+        .status()
+        .map_err(|err| format!("launch editor {}: {err}", editor))?;
+
+    if !status.success() {
+        return Err(format!("editor exited with {status}"));
+    }
+
+    // Show diff
+    let output = std::process::Command::new("diff")
+        .args(["-ruN", "--exclude=.git", "--exclude=.devdrop"])
+        .arg(&repo)
+        .arg(&overlay)
+        .output()
+        .map_err(|err| format!("run diff: {err}"))?;
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+
+    // Prompt to accept
+    print!("Accept changes? [y/N] ");
+    std::io::stdout().flush().ok();
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input).ok();
+    let accept = input.trim().eq_ignore_ascii_case("y");
+
+    if accept {
+        sync_tree(std::path::Path::new(&overlay), std::path::Path::new(&repo))?;
+        update_agent_status(&root, &id, "accepted")?;
+        println!("Changes accepted");
+    } else {
+        update_agent_status(&root, &id, "rejected")?;
+        println!("Changes rejected");
+    }
     Ok(())
 }
 
