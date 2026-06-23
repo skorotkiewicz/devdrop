@@ -6,7 +6,8 @@ use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn main() -> ExitCode {
     match run() {
@@ -31,6 +32,7 @@ fn run() -> Result<(), String> {
         Some("remote") => cmd_remote(&args[1..]),
         Some("secret") => cmd_secret(&args[1..]),
         Some("run") => cmd_run(&args[1..]),
+        Some("daemon") => cmd_daemon(&args[1..]),
         Some("sync") => cmd_sync(&args[1..]),
         Some("status") => cmd_status(optional_path(args.get(1))?),
         Some("ls") => cmd_ls(optional_path(args.get(1))?),
@@ -58,6 +60,7 @@ Usage:
   devdrop secret unlock <path> [--scope <scope>]
   devdrop secret lock <path> [--scope <scope>]
   devdrop run --repo <path> --secret-scope <scope> -- <command>
+  devdrop daemon [path] [--remote <path>] [--interval <seconds>] [--once]
   devdrop sync [path] [--remote <path>] [--pull]
   devdrop status [path]
   devdrop ls [path]
@@ -165,6 +168,61 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     }
 }
 
+fn cmd_daemon(args: &[String]) -> Result<(), String> {
+    let root = optional_path(first_positional(args))?;
+    let root = workspace_root_for(&root)?;
+    let remote = flag_value(args, "--remote")
+        .map(PathBuf::from)
+        .or_else(|| read_remote_config(&root).ok().flatten());
+    let interval = flag_value(args, "--interval")
+        .unwrap_or("2")
+        .parse::<u64>()
+        .map_err(|err| format!("invalid --interval: {err}"))?
+        .max(1);
+    let once = args.iter().any(|arg| arg == "--once");
+    let mut last_signature = None;
+
+    println!(
+        "daemon watching: {} interval={}s{}",
+        display_path(&root),
+        interval,
+        remote
+            .as_ref()
+            .map(|path| format!(" remote={}", display_path(path)))
+            .unwrap_or_default()
+    );
+
+    loop {
+        let rules = Rules::load(&root)?;
+        let snapshot = collect_index(&root, &rules)?;
+        let signature = snapshot_signature(&snapshot);
+
+        if last_signature != Some(signature) {
+            write_index(&root, &rules, &snapshot)?;
+            if let Some(remote) = &remote {
+                push_remote(&root, remote, &snapshot)?;
+                write_remote_config(&root, remote)?;
+            }
+            println!(
+                "daemon synced: nodes={} blobs={} repos={}",
+                snapshot.nodes.len(),
+                snapshot.blobs.len(),
+                snapshot.repos.len()
+            );
+            last_signature = Some(signature);
+        } else if once {
+            println!("daemon scan: no changes");
+        }
+
+        if once {
+            return Ok(());
+        }
+
+        // ponytail: polling watcher, replace with notify/FSEvents/inotify when dependency policy allows.
+        thread::sleep(Duration::from_secs(interval));
+    }
+}
+
 fn cmd_secret_add(path: &Path, scope: &str) -> Result<(), String> {
     require_secret_key()?;
     if !path.is_file() {
@@ -267,6 +325,30 @@ fn sync_local_index(root: &Path) -> Result<IndexSnapshot, String> {
     let snapshot = collect_index(root, &rules)?;
     write_index(root, &rules, &snapshot)?;
     Ok(snapshot)
+}
+
+fn snapshot_signature(snapshot: &IndexSnapshot) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    let mut nodes = snapshot.nodes.iter().collect::<Vec<_>>();
+    nodes.sort_by(|left, right| left.path.cmp(&right.path));
+
+    for node in nodes {
+        for part in [
+            node.path.as_str(),
+            node.kind.as_str(),
+            node.local_state.as_str(),
+            node.content_hash.as_deref().unwrap_or(""),
+        ] {
+            hash ^= fnv_bytes(part.as_bytes());
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash ^= node.size;
+        hash = hash.wrapping_mul(0x100000001b3);
+        hash ^= node.local_mtime as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+
+    hash
 }
 
 fn cmd_status(root: PathBuf) -> Result<(), String> {
@@ -441,6 +523,7 @@ fn cmd_doctor(root: PathBuf) -> Result<(), String> {
     let db = db_path(&root);
     let objects = object_store_path(&root);
     let secrets = secret_store_path(&root);
+    let remote = read_remote_config(&root).ok().flatten();
 
     println!("workspace: ok {}", display_path(&root));
     println!(
@@ -471,8 +554,15 @@ fn cmd_doctor(root: PathBuf) -> Result<(), String> {
         "object store: {}",
         if objects.is_dir() { "ok" } else { "missing" }
     );
-    println!("daemon: not implemented");
-    println!("remote manifest: not configured");
+    println!("daemon: ok polling");
+    println!("watcher: ok polling");
+    println!(
+        "remote manifest: {}",
+        remote
+            .as_ref()
+            .map(|path| format!("configured {}", display_path(path)))
+            .unwrap_or_else(|| "not configured".to_string())
+    );
     println!(
         "secret vault: {}",
         if secrets.is_dir() {
@@ -755,8 +845,9 @@ fn first_positional(args: &[String]) -> Option<&String> {
             continue;
         }
         match arg.as_str() {
-            "--remote" => skip_next = true,
+            "--interval" | "--remote" | "--repo" | "--scope" | "--secret-scope" => skip_next = true,
             "--pull" => {}
+            "--once" => {}
             _ if arg.starts_with("--") => {}
             _ => return Some(arg),
         }
