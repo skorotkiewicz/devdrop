@@ -76,7 +76,7 @@ Usage:
   devdrop agent reject <agent-id>
   devdrop overlay diff [agent-id]
   devdrop overlay submit [agent-id]
-  devdrop run --repo <path> --secret-scope <scope> -- <command>
+  devdrop run --repo <path> [--secret-scope <scope>] -- <command>
   devdrop daemon [path] [--remote <path>] [--interval <seconds>] [--once]
   devdrop sync [path] [--remote <path>] [--pull]
   devdrop status [path] [--json]
@@ -96,7 +96,13 @@ Usage:
 
 fn cmd_login(user: Option<&String>) -> Result<(), String> {
     let cwd = env::current_dir().map_err(|err| format!("current dir: {err}"))?;
-    let root = find_workspace_root(&cwd).unwrap_or(cwd);
+    let existing = find_workspace_root(&cwd);
+    // Don't silently create a workspace — tell the user what's happening.
+    if existing.is_none() {
+        println!("no workspace found; initializing at {}", display_path(&cwd));
+    }
+    let root = existing.unwrap_or(cwd);
+
     init_workspace_storage(&root)?;
     let user = user
         .cloned()
@@ -301,7 +307,9 @@ fn cmd_agent_create(repo: &Path, write_scope: &str, secret_scope: &str) -> Resul
     init_db(&root)?;
     let id = format!("agent_{}", now_nanos());
     let overlay = agent_overlay_path(&root, &id);
-    copy_tree(repo, &overlay)?;
+    let base = agent_base_path(&root, &id);
+    copy_tree(repo, &base)?;
+    copy_tree(&base, &overlay)?;
     upsert_agent(
         &root,
         &id,
@@ -356,8 +364,27 @@ fn cmd_agent_status() -> Result<(), String> {
 fn cmd_agent_diff(id: &str) -> Result<(), String> {
     let (root, agent) = find_agent(id)?;
     ensure_agent_reviewable(&agent)?;
+
+    // Show scope violations before the diff so the user knows what will be
+    // rejected at accept time.
+    let violations = agent_scope_violations(&root, &agent)?;
+    if !violations.is_empty() {
+        eprintln!(
+            "\u{1b}[33mwarning: {} path(s) outside write scope `{}`:\u{1b}[0m",
+            violations.len(),
+            agent.write_scope
+        );
+        for path in &violations {
+            eprintln!("  {path}");
+        }
+        eprintln!();
+    }
+
+    // Exclude .git and .devdrop — they are intentionally absent from the
+    // overlay (skip_overlay_component filters them during copy_tree).
+    // Without --exclude, diff floods with "Only in ./.git/..." noise.
     let output = Command::new("diff")
-        .args(["-ruN"])
+        .args(["-ruN", "--exclude=.git", "--exclude=.devdrop"])
         .arg(&agent.repo_path)
         .arg(&agent.overlay_path)
         .output()
@@ -381,7 +408,7 @@ fn cmd_agent_finish(id: &str, accept: bool) -> Result<(), String> {
     let (root, agent) = find_agent(id)?;
     ensure_agent_reviewable(&agent)?;
     if accept {
-        let violations = agent_scope_violations(&agent)?;
+        let violations = agent_scope_violations(&root, &agent)?;
         if !violations.is_empty() {
             log_operation(
                 &root,
@@ -398,6 +425,24 @@ fn cmd_agent_finish(id: &str, accept: bool) -> Result<(), String> {
                 "overlay changes outside write scope `{}`: {}",
                 agent.write_scope,
                 violations.join(", ")
+            ));
+        }
+        let stale = agent_stale_paths(&root, &agent)?;
+        if !stale.is_empty() {
+            log_operation(
+                &root,
+                "agent_accept_stale",
+                &agent.repo_path,
+                &format!(
+                    "{{\"agent\":{},\"path\":{}}}",
+                    json_string(id),
+                    json_string(&stale[0])
+                ),
+                "blocked",
+            )?;
+            return Err(format!(
+                "repo changed since overlay was created: {}",
+                stale.join(", ")
             ));
         }
         sync_tree(Path::new(&agent.overlay_path), Path::new(&agent.repo_path))?;
@@ -1322,6 +1367,10 @@ fn agent_overlay_path(root: &Path, id: &str) -> PathBuf {
     root.join(".devdrop/agents").join(id).join("overlay")
 }
 
+fn agent_base_path(root: &Path, id: &str) -> PathBuf {
+    root.join(".devdrop/agents").join(id).join("base")
+}
+
 fn upsert_agent(
     root: &Path,
     id: &str,
@@ -1434,10 +1483,10 @@ fn ensure_agent_reviewable(agent: &AgentRow) -> Result<(), String> {
 }
 
 // ponytail: full tree scan at accept time; use indexed overlay diffs when repos get large.
-fn agent_scope_violations(agent: &AgentRow) -> Result<Vec<String>, String> {
-    let repo = tree_signature(Path::new(&agent.repo_path))?;
+fn agent_scope_violations(root: &Path, agent: &AgentRow) -> Result<Vec<String>, String> {
+    let base = agent_base_signature(root, agent)?;
     let overlay = tree_signature(Path::new(&agent.overlay_path))?;
-    let mut paths = repo
+    let mut paths = base
         .keys()
         .chain(overlay.keys())
         .cloned()
@@ -1448,15 +1497,49 @@ fn agent_scope_violations(agent: &AgentRow) -> Result<Vec<String>, String> {
 
     Ok(paths
         .into_iter()
-        .filter(|path| repo.get(path) != overlay.get(path))
+        .filter(|path| base.get(path) != overlay.get(path))
         .filter(|path| {
-            let is_dir = repo
+            let is_dir = base
                 .get(path)
                 .or_else(|| overlay.get(path))
                 .is_some_and(|entry| entry == "dir");
             !write_scope_allows(&agent.write_scope, path, is_dir)
         })
         .collect())
+}
+
+fn agent_stale_paths(root: &Path, agent: &AgentRow) -> Result<Vec<String>, String> {
+    let base_path = agent_base_path(root, &agent.id);
+    if !base_path.is_dir() {
+        return Ok(Vec::new());
+    }
+    let base = tree_signature(&base_path)?;
+    let repo = tree_signature(Path::new(&agent.repo_path))?;
+    let overlay = tree_signature(Path::new(&agent.overlay_path))?;
+    let mut paths = base
+        .keys()
+        .chain(repo.keys())
+        .chain(overlay.keys())
+        .cloned()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    paths.sort();
+
+    Ok(paths
+        .into_iter()
+        .filter(|path| repo.get(path) != base.get(path))
+        .filter(|path| repo.get(path) != overlay.get(path))
+        .collect())
+}
+
+fn agent_base_signature(root: &Path, agent: &AgentRow) -> Result<HashMap<String, String>, String> {
+    let base = agent_base_path(root, &agent.id);
+    if base.is_dir() {
+        tree_signature(&base)
+    } else {
+        tree_signature(Path::new(&agent.repo_path))
+    }
 }
 
 fn write_scope_allows(scope: &str, rel: &str, is_dir: bool) -> bool {
@@ -3578,9 +3661,11 @@ PLAIN=value
         let root = env::temp_dir().join(format!("devdrop-test-{}", now_nanos()));
         let repo = root.join("repo");
         let overlay = root.join("overlay");
+        let base = agent_base_path(&root, "agent_test");
         fs::create_dir_all(repo.join("src")).unwrap();
         fs::write(repo.join("src/app.rs"), "one\n").unwrap();
         fs::write(repo.join("README.md"), "docs\n").unwrap();
+        copy_tree(&repo, &base).unwrap();
         copy_tree(&repo, &overlay).unwrap();
         fs::write(overlay.join("src/app.rs"), "two\n").unwrap();
         fs::write(overlay.join("README.md"), "changed\n").unwrap();
@@ -3595,8 +3680,37 @@ PLAIN=value
         };
 
         assert_eq!(
-            agent_scope_violations(&agent).unwrap(),
+            agent_scope_violations(&root, &agent).unwrap(),
             vec!["README.md".to_string()]
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn agent_stale_paths_report_live_repo_changes() {
+        let root = env::temp_dir().join(format!("devdrop-test-{}", now_nanos()));
+        let repo = root.join("repo");
+        let overlay = root.join("overlay");
+        let base = agent_base_path(&root, "agent_test");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src/app.rs"), "one\n").unwrap();
+        copy_tree(&repo, &base).unwrap();
+        copy_tree(&base, &overlay).unwrap();
+        fs::write(repo.join("src/app.rs"), "user\n").unwrap();
+        fs::write(overlay.join("src/app.rs"), "agent\n").unwrap();
+
+        let agent = AgentRow {
+            id: "agent_test".into(),
+            repo_path: repo.to_string_lossy().into_owned(),
+            overlay_path: overlay.to_string_lossy().into_owned(),
+            write_scope: "src/**".into(),
+            secret_scope: String::new(),
+            status: "pending".into(),
+        };
+
+        assert_eq!(
+            agent_stale_paths(&root, &agent).unwrap(),
+            vec!["src/app.rs".to_string()]
         );
         fs::remove_dir_all(root).ok();
     }
