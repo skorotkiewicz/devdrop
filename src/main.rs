@@ -3041,8 +3041,73 @@ fn pull_remote(root: &Path, remote: &Path) -> Result<(), String> {
 
     pull_remote_secrets(root, remote)?;
     pull_remote_devices(root, remote)?;
+    materialize_pull_conflicts(root, remote, &nodes)?;
     write_pulled_index(root, &nodes)?;
     Ok(())
+}
+
+fn materialize_pull_conflicts(
+    root: &Path,
+    remote: &Path,
+    nodes: &[RemoteNode],
+) -> Result<(), String> {
+    for node in nodes.iter().filter(|node| node.kind == "file") {
+        let Some(hash) = &node.content_hash else {
+            continue;
+        };
+        let path = root.join(&node.path);
+        if !path.is_file() {
+            continue;
+        }
+
+        let (local_hash, _) = file_hash(&path)?;
+        if &local_hash == hash {
+            continue;
+        }
+
+        let object = object_path(root, hash);
+        if !object.exists() {
+            let remote_object = remote_object_path(remote, hash);
+            fs::copy(&remote_object, &object).map_err(|err| {
+                format!("copy remote object {}: {err}", display_path(&remote_object))
+            })?;
+        }
+
+        let conflict = conflict_sibling_path(&path, "remote")?;
+        if let Some(parent) = conflict.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|err| format!("create {}: {err}", display_path(parent)))?;
+        }
+        fs::copy(&object, &conflict)
+            .map_err(|err| format!("write conflict {}: {err}", display_path(&conflict)))?;
+        log_operation(
+            root,
+            "pull_conflict",
+            &node.path,
+            &format!("{{\"remote_hash\":{}}}", json_string(hash)),
+            "conflicted",
+        )?;
+        println!(
+            "conflict: kept local {}, wrote remote {}",
+            display_path(&path),
+            display_path(&conflict)
+        );
+    }
+
+    Ok(())
+}
+
+fn conflict_sibling_path(path: &Path, source: &str) -> Result<PathBuf, String> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("no filename for {}", display_path(path)))?
+        .to_string_lossy();
+    let split = name
+        .rfind('.')
+        .filter(|index| *index > 0)
+        .unwrap_or(name.len());
+    let marker = format!(" (conflict from {source} {})", now_nanos());
+    Ok(path.with_file_name(format!("{}{}{}", &name[..split], marker, &name[split..])))
 }
 
 fn remote_node(node: &IndexNode) -> bool {

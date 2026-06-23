@@ -2,17 +2,18 @@
 set -euo pipefail
 
 # devdrop workflow test script
-# Tests and demonstrates core devdrop functionality
+# End-to-end devdrop workflow smoke
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEMP_DIR=$(mktemp -d)
 trap "rm -rf $TEMP_DIR" EXIT
 
 # Build devdrop first
 echo "=== Building devdrop ===" >&2
-cargo build --release 2>/dev/null
+cargo build --release --manifest-path "$REPO_ROOT/Cargo.toml" 2>/dev/null
 
-DEVDROP="$SCRIPT_DIR/target/release/devdrop"
+DEVDROP="$REPO_ROOT/target/release/devdrop"
 
 # Setup test workspace
 TEST_WS="$TEMP_DIR/workspace"
@@ -57,6 +58,7 @@ cd "$TEST_WS/project"
 git init
 git config user.email "test@test.com"
 git config user.name "Test"
+git config commit.gpgsign false
 git add .
 git commit -m "init"
 cd "$TEST_WS"
@@ -82,6 +84,30 @@ cd "$TEST_WS2"
 $DEVDROP sync "$TEST_WS2" --remote "$TEST_REMOTE" --pull
 $DEVDROP ls "$TEST_WS2"
 echo "PASS: Remote pull works"
+
+echo "=== Test 11b: Device state syncs between workspaces ===" >&2
+$DEVDROP device list | grep -q "test-device"
+$DEVDROP login testuser
+$DEVDROP device enroll "second-device"
+$DEVDROP sync "$TEST_WS2" --remote "$TEST_REMOTE"
+cd "$TEST_WS"
+$DEVDROP sync "$TEST_WS" --remote "$TEST_REMOTE" --pull
+$DEVDROP device list | grep -q "second-device"
+echo "PASS: Device state syncs"
+
+echo "=== Test 11c: Pull conflict keeps local and remote edits ===" >&2
+echo "remote edit" > "$TEST_WS/project/README.md"
+cd "$TEST_WS"
+$DEVDROP sync "$TEST_WS" --remote "$TEST_REMOTE"
+echo "local edit" > "$TEST_WS2/project/README.md"
+cd "$TEST_WS2"
+$DEVDROP sync "$TEST_WS2" --remote "$TEST_REMOTE" --pull
+test "$(cat "$TEST_WS2/project/README.md")" = "local edit"
+CONFLICT_FILE=$(find "$TEST_WS2/project" -name 'README (conflict from remote *).md' -print -quit)
+test -n "$CONFLICT_FILE"
+test "$(cat "$CONFLICT_FILE")" = "remote edit"
+$DEVDROP conflicts "$TEST_WS2" | grep -q "README"
+echo "PASS: Pull conflict keeps both versions"
 
 echo "=== Test 12: Secrets (requires openssl) ===" >&2
 if command -v openssl &>/dev/null; then
@@ -112,6 +138,18 @@ echo "PASS: Agent diff shows changes"
 echo "=== Test 13c: Agent accept (apply overlay) ===" >&2
 $DEVDROP agent accept "$AGENT_ID"
 echo "PASS: Agent changes accepted"
+
+echo "=== Test 13d: Stale agent accept is blocked ===" >&2
+STALE_AGENT_ID=$($DEVDROP agent create --repo "$TEST_WS/project" --write-scope "src/**" --secret-scope "" | head -1 | awk '{print $3}')
+echo "agent" > "$TEST_WS/.devdrop/agents/$STALE_AGENT_ID/overlay/src/stale.rs"
+echo "user" > "$TEST_WS/project/src/stale.rs"
+cd "$TEST_WS"
+$DEVDROP overlay submit "$STALE_AGENT_ID"
+if $DEVDROP agent accept "$STALE_AGENT_ID"; then
+    echo "FAIL: stale agent accept should fail"
+    exit 1
+fi
+test "$(cat "$TEST_WS/project/src/stale.rs")" = "user" && echo "PASS: Stale agent accept blocked" || echo "FAIL"
 
 echo "=== Test 14: Doctor check ===" >&2
 $DEVDROP doctor "$TEST_WS"
