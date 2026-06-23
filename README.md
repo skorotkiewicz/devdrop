@@ -9,6 +9,16 @@ recovery, and reviewable agent overlays.
 It is not a Git replacement. Git owns source history; devdrop owns the working
 workspace around it.
 
+## Install
+
+Arch Linux:
+
+```sh
+yay -S devdrop
+# or
+paru -S devdrop
+```
+
 ## Start
 
 ```sh
