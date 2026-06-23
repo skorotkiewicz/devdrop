@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="50" height="50" viewBox="0 0 50 50" role="img" aria-labelledby="title desc">
+  <title id="title">devdrop</title>
+  <desc id="desc">A minimal drop-shaped developer workspace mark</desc>
+  <rect width="50" height="50" rx="12" fill="#fbfaf7"/>
+  <path d="M25 6 38 21c6 7 1 19-13 19S6 28 12 21L25 6Z" fill="#176b5c"/>
+  <path d="M18 25h14M18 30h10" fill="none" stroke="#fbfaf7" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="32" cy="17" r="3" fill="#d7a84f"/>
+</svg>

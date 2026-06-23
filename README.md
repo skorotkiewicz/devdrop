@@ -1,6 +1,17 @@
-# devdrop
+<p align="center">
+  <img src="docs/logo.svg" width="50" height="50" alt="devdrop logo">
+</p>
 
-Local-first workspace sync for developers.
+<h1 align="center">devdrop</h1>
+
+<p align="center">Local-first workspace sync for developers.</p>
+
+<p align="center">
+  <a href="https://github.com/skorotkiewicz/devdrop/releases"><img alt="release" src="https://img.shields.io/github/v/release/skorotkiewicz/devdrop?style=flat-square"></a>
+  <a href="https://aur.archlinux.org/packages/devdrop"><img alt="aur" src="https://img.shields.io/aur/version/devdrop?style=flat-square"></a>
+  <img alt="license" src="https://img.shields.io/badge/license-MIT-176b5c?style=flat-square">
+  <img alt="rust" src="https://img.shields.io/badge/rust-2024-7a4d12?style=flat-square">
+</p>
 
 devdrop keeps a code folder understandable across machines and agents: file
 state, generated-folder ignores, Git status, encrypted secrets, history,
