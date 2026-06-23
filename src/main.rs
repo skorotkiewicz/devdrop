@@ -59,7 +59,7 @@ devdrop - local-first workspace helper
 
 Usage:
   devdrop login [user]
-  devdrop workspace init <path>
+  devdrop workspace init|mount <path>
   devdrop device enroll <name>
   devdrop device list
   devdrop repo update [path]
@@ -115,12 +115,12 @@ fn cmd_login(user: Option<&String>) -> Result<(), String> {
 fn cmd_workspace(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("init") | Some("mount") => {
-            let path = required_path(args.get(1), "workspace init")?;
+            let path = required_path(args.get(1), "workspace init|mount")?;
             init_workspace_storage(&path)?;
             println!("workspace initialized: {}", display_path(&path));
             Ok(())
         }
-        _ => Err("usage: devdrop workspace init <path>".into()),
+        _ => Err("usage: devdrop workspace init|mount <path>".into()),
     }
 }
 
