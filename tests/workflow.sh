@@ -98,9 +98,10 @@ $DEVDROP workspace init "$TEST_WS3"
 cd "$TEST_WS3"
 $DEVDROP sync "$TEST_WS3" --remote "$TEST_REMOTE" --pull
 $DEVDROP ls "$TEST_WS3/project/src" | grep -q "main.rs"
-$DEVDROP hydrate "$TEST_WS3/project/src/main.rs"
+$DEVDROP pin "$TEST_WS3/project/src"
+$DEVDROP sync "$TEST_WS3" --remote "$TEST_REMOTE" --pull
 grep -q "fn main" "$TEST_WS3/project/src/main.rs"
-echo "PASS: Unhydrated push preserves remote namespace"
+echo "PASS: Unhydrated push preserves remote namespace and pins hydrate"
 
 cd "$TEST_WS"
 $DEVDROP sync "$TEST_WS" --remote "$TEST_REMOTE" --pull

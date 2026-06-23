@@ -3138,6 +3138,7 @@ fn pull_remote(root: &Path, remote: &Path) -> Result<(), String> {
     materialize_pull_conflicts(root, remote, &nodes)?;
     apply_remote_tombstones(root, &tombstones)?;
     write_pulled_index(root, &nodes)?;
+    hydrate_pins_from_remote(root, remote, &nodes)?;
     Ok(())
 }
 
@@ -3203,6 +3204,58 @@ fn conflict_sibling_path(path: &Path, source: &str) -> Result<PathBuf, String> {
         .unwrap_or(name.len());
     let marker = format!(" (conflict from {source} {})", now_nanos());
     Ok(path.with_file_name(format!("{}{}{}", &name[..split], marker, &name[split..])))
+}
+
+fn hydrate_pins_from_remote(
+    root: &Path,
+    remote: &Path,
+    nodes: &[RemoteNode],
+) -> Result<(), String> {
+    let pins = read_pins(root)?;
+    if pins.is_empty() {
+        return Ok(());
+    }
+
+    for node in nodes.iter().filter(|node| node.kind == "file") {
+        let Some(hash) = &node.content_hash else {
+            continue;
+        };
+        if !pins.iter().any(|pin| pin_matches(pin, &node.path)) {
+            continue;
+        }
+
+        let path = root.join(&node.path);
+        if path.exists() {
+            continue;
+        }
+
+        let object = object_path(root, hash);
+        if !object.exists() {
+            let remote_object = remote_object_path(remote, hash);
+            fs::copy(&remote_object, &object).map_err(|err| {
+                format!("copy remote object {}: {err}", display_path(&remote_object))
+            })?;
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|err| format!("create {}: {err}", display_path(parent)))?;
+        }
+        fs::copy(&object, &path)
+            .map_err(|err| format!("hydrate pinned {}: {err}", display_path(&path)))?;
+        mark_node_local(root, &node.path)?;
+        log_operation(root, "hydrate_pinned", &node.path, "{}", "done")?;
+        println!("hydrated pinned: {}", display_path(&path));
+    }
+
+    Ok(())
+}
+
+fn pin_matches(pin: &str, rel: &str) -> bool {
+    pin == "."
+        || rel == pin
+        || rel
+            .strip_prefix(pin)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 struct RemoteTombstone {
