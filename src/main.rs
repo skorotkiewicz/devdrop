@@ -38,7 +38,7 @@ fn run() -> Result<(), String> {
         Some("status") => cmd_status(optional_path(args.get(1))?),
         Some("ls") => cmd_ls(optional_path(args.get(1))?),
         Some("ignored") => cmd_ignored(optional_path(args.get(1))?),
-        Some("conflicts") => cmd_conflicts(optional_path(args.get(1))?),
+        Some("conflicts") => cmd_conflicts(&args[1..]),
         Some("repo-status") => cmd_repo_status(optional_path(args.get(1))?),
         Some("doctor") => cmd_doctor(optional_path(args.get(1))?),
         Some("hydrate") => cmd_hydrate(required_path(args.get(1), "hydrate")?),
@@ -72,6 +72,7 @@ Usage:
   devdrop ls [path]
   devdrop ignored [path]
   devdrop conflicts [path]
+  devdrop conflicts resolve <path> --use base|conflict
   devdrop repo-status [path]
   devdrop hydrate <path>
   devdrop pin <path>
@@ -589,7 +590,14 @@ fn cmd_ignored(root: PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_conflicts(root: PathBuf) -> Result<(), String> {
+fn cmd_conflicts(args: &[String]) -> Result<(), String> {
+    if args.first().map(String::as_str) == Some("resolve") {
+        let path = required_path(args.get(1), "conflicts resolve")?;
+        let choice = flag_value(args, "--use").unwrap_or("base");
+        return cmd_conflicts_resolve(&path, choice);
+    }
+
+    let root = optional_path(args.first())?;
     require_dir(&root)?;
     let rules = Rules::load(&root)?;
     let mut printed = 0;
@@ -609,6 +617,137 @@ fn cmd_conflicts(root: PathBuf) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn cmd_conflicts_resolve(path: &Path, choice: &str) -> Result<(), String> {
+    let pair = conflict_pair(path)?;
+    let root = find_workspace_root(&pair.base)
+        .or_else(|| find_workspace_root(&pair.conflict))
+        .ok_or_else(|| {
+            "no .devdrop workspace found; run `devdrop workspace init <path>`".to_string()
+        })?;
+
+    match choice {
+        "base" | "ours" => {
+            archive_conflict_file(&root, &pair.conflict)?;
+        }
+        "conflict" | "theirs" => {
+            archive_conflict_file(&root, &pair.base)?;
+            if let Some(parent) = pair.base.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|err| format!("create {}: {err}", display_path(parent)))?;
+            }
+            fs::rename(&pair.conflict, &pair.base)
+                .or_else(|_| {
+                    fs::copy(&pair.conflict, &pair.base)?;
+                    fs::remove_file(&pair.conflict)
+                })
+                .map_err(|err| format!("resolve conflict: {err}"))?;
+        }
+        _ => return Err("usage: devdrop conflicts resolve <path> --use base|conflict".into()),
+    }
+
+    log_operation(
+        &root,
+        "conflict_resolve",
+        &pin_path(&root, &pair.base),
+        &format!("{{\"use\":{}}}", json_string(choice)),
+        "done",
+    )?;
+    println!("resolved conflict: {}", display_path(&pair.base));
+    Ok(())
+}
+
+struct ConflictPair {
+    base: PathBuf,
+    conflict: PathBuf,
+}
+
+fn conflict_pair(path: &Path) -> Result<ConflictPair, String> {
+    if is_conflict_path(&pin_path(Path::new(""), path)) {
+        let base = conflict_base_path(path)?;
+        if !path.exists() {
+            return Err(format!("conflict file not found: {}", display_path(path)));
+        }
+        return Ok(ConflictPair {
+            base,
+            conflict: path.to_path_buf(),
+        });
+    }
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("no parent directory for {}", display_path(path)))?;
+    let matches = fs::read_dir(parent)
+        .map_err(|err| format!("read {}: {err}", display_path(parent)))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|candidate| is_conflict_path(&pin_path(Path::new(""), candidate)))
+        .filter_map(|candidate| {
+            conflict_base_path(&candidate)
+                .ok()
+                .filter(|base| base == path)
+                .map(|_| candidate)
+        })
+        .collect::<Vec<_>>();
+
+    match matches.as_slice() {
+        [conflict] => Ok(ConflictPair {
+            base: path.to_path_buf(),
+            conflict: conflict.clone(),
+        }),
+        [] => Err(format!(
+            "no conflict sibling found for {}",
+            display_path(path)
+        )),
+        _ => Err(format!(
+            "multiple conflict siblings found for {}",
+            display_path(path)
+        )),
+    }
+}
+
+fn conflict_base_path(path: &Path) -> Result<PathBuf, String> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("no filename for {}", display_path(path)))?
+        .to_string_lossy();
+    let start = name
+        .find(" (conflict from ")
+        .ok_or_else(|| format!("not a conflict path: {}", display_path(path)))?;
+    let end = name[start..]
+        .find(')')
+        .map(|end| start + end + 1)
+        .ok_or_else(|| format!("bad conflict filename: {}", display_path(path)))?;
+    let base_name = format!("{}{}", &name[..start], &name[end..]);
+    Ok(path.with_file_name(base_name))
+}
+
+fn archive_conflict_file(root: &Path, path: &Path) -> Result<PathBuf, String> {
+    if !path.exists() {
+        return Err(format!(
+            "cannot archive missing file: {}",
+            display_path(path)
+        ));
+    }
+
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    let archive = root
+        .join(".devdrop/resolved-conflicts")
+        .join(now_nanos().to_string())
+        .join(rel);
+    if let Some(parent) = archive.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("create {}: {err}", display_path(parent)))?;
+    }
+    fs::rename(path, &archive)
+        .or_else(|_| {
+            fs::copy(path, &archive)?;
+            fs::remove_file(path)
+        })
+        .map_err(|err| format!("archive {}: {err}", display_path(path)))?;
+    println!("archived: {}", display_path(&archive));
+    Ok(archive)
 }
 
 fn cmd_repo_status(root: PathBuf) -> Result<(), String> {
@@ -2734,6 +2873,17 @@ mod tests {
             "src/config (conflict from Mac Mini 2026-06-23 10-41).ts"
         ));
         assert!(!is_conflict_path("src/conflict-free.ts"));
+    }
+
+    #[test]
+    fn conflict_base_path_removes_marker() {
+        assert_eq!(
+            conflict_base_path(Path::new(
+                "src/config (conflict from Mac Mini 2026-06-23 10-41).ts"
+            ))
+            .unwrap(),
+            PathBuf::from("src/config.ts")
+        );
     }
 
     #[test]
